@@ -5,8 +5,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
 
-from agentgate.domain import EvaluatorRef, RunStatus
-from agentgate.result import EvaluationComparison
+from agentgate.domain import (
+    ComparisonGateDecision,
+    ComparisonGateSpec,
+    EvaluatorRef,
+    RunStatus,
+)
+from agentgate.result import EvaluationComparison, RunComparisonAnalysis
 from agentgate.server.dependencies import ServerDependencies, get_dependencies
 from agentgate.server.errors import (
     raise_conflict,
@@ -45,6 +50,14 @@ class RunComparisonVariant(BaseModel):
 class RunComparisonSubmission(BaseModel):
     baseline: RunComparisonVariant
     candidate: RunComparisonVariant
+
+
+class RunComparisonGateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    baseline_run_id: str = Field(min_length=1)
+    candidate_run_id: str = Field(min_length=1)
+    gate_spec: ComparisonGateSpec
 
 
 @router.post(
@@ -100,6 +113,56 @@ def compare_runs(
         return dependencies.results.compare_runs(
             baseline_run_id,
             candidate_run_id,
+        )
+    except LookupError as error:
+        raise_not_found(error)
+    except ValueError as error:
+        raise_conflict(error)
+
+
+@router.get(
+    "/run-comparisons/analysis",
+    response_model=RunComparisonAnalysis,
+)
+def analyze_runs(
+    baseline_run_id: str,
+    candidate_run_id: str,
+    dependencies: Dependencies,
+) -> RunComparisonAnalysis:
+    try:
+        return dependencies.results.analyze_runs(
+            baseline_run_id,
+            candidate_run_id,
+        )
+    except LookupError as error:
+        raise_not_found(error)
+    except ValueError as error:
+        raise_conflict(error)
+
+
+@router.get(
+    "/run-comparisons/gate-defaults",
+    response_model=ComparisonGateSpec,
+)
+def get_comparison_gate_defaults(
+    dependencies: Dependencies,
+) -> ComparisonGateSpec:
+    return dependencies.results.get_comparison_gate_defaults()
+
+
+@router.post(
+    "/run-comparisons/gate",
+    response_model=ComparisonGateDecision,
+)
+def evaluate_comparison_gate(
+    request: RunComparisonGateRequest,
+    dependencies: Dependencies,
+) -> ComparisonGateDecision:
+    try:
+        return dependencies.results.evaluate_comparison_gate(
+            request.baseline_run_id,
+            request.candidate_run_id,
+            request.gate_spec,
         )
     except LookupError as error:
         raise_not_found(error)

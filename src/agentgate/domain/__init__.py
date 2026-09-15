@@ -13,6 +13,20 @@ from .base import (
     utcnow,
 )
 from .case import Case, CaseCategory, CaseDifficulty, CaseTurn
+from .comparison_gate import (
+    ComparisonConditionDecision,
+    ComparisonConditionReason,
+    ComparisonFact,
+    ComparisonFactUnavailableReason,
+    ComparisonGateDecision,
+    ComparisonGateOutcome,
+    ComparisonGateRule,
+    ComparisonGateSpec,
+    ComparisonMetricId,
+    ComparisonOperator,
+    ConditionStatus,
+    FactAvailability,
+)
 from .credential import ApiKeyMetadata, ApiKeyScope
 from .dataset import Dataset, DatasetVersion, DatasetVersionStatus
 from .evaluator import (
