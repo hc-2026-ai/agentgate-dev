@@ -8,6 +8,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from agentgate.domain import (
+    ComparisonGateDecision,
+    ComparisonGateSpec,
     EvaluationReport,
     EvaluationRun,
     RunManifest,
@@ -17,6 +19,16 @@ from agentgate.domain import (
 from agentgate.domain.base import normalize_utc, utcnow
 from agentgate.result.analytics import ResultAnalytics, calculate_result_analytics
 from agentgate.result.comparison import EvaluationComparison, compare_reports
+from agentgate.result.comparison_facts import (
+    RunComparisonAnalysis,
+    compare_badcases,
+    derive_comparison_facts,
+)
+from agentgate.result.comparison_gate import (
+    decide_comparison_gate,
+    default_comparison_gate_spec,
+)
+from agentgate.result.comparison_slices import compare_result_breakdowns
 from agentgate.result.report import build_evaluation_report
 from agentgate.storage.repository import AgentGateRepository
 from agentgate.trace.redaction import redact_trace
@@ -179,6 +191,77 @@ class ResultReader:
             self.get_report(baseline_run_id),
             self.get_report(candidate_run_id),
         )
+
+    def analyze_runs(
+        self,
+        baseline_run_id: str,
+        candidate_run_id: str,
+    ) -> RunComparisonAnalysis:
+        """Assemble all persisted evidence for one compatible Run comparison."""
+
+        baseline_run = self._get_run(baseline_run_id)
+        candidate_run = self._get_run(candidate_run_id)
+        if (
+            baseline_run.status is not RunStatus.COMPLETED
+            or candidate_run.status is not RunStatus.COMPLETED
+        ):
+            raise ValueError(
+                "Run comparison analysis requires completed EvaluationRuns"
+            )
+
+        baseline_results = tuple(self.repository.list_results(baseline_run.id))
+        candidate_results = tuple(self.repository.list_results(candidate_run.id))
+        baseline_report = build_evaluation_report(baseline_run, baseline_results)
+        candidate_report = build_evaluation_report(candidate_run, candidate_results)
+        comparison = compare_reports(baseline_report, candidate_report)
+        baseline_analytics = calculate_result_analytics(
+            baseline_run,
+            baseline_results,
+        )
+        candidate_analytics = calculate_result_analytics(
+            candidate_run,
+            candidate_results,
+        )
+        badcases = compare_badcases(baseline_report, candidate_report)
+        expected_case_ids = tuple(
+            case.id for case in baseline_run.manifest.execution_cases
+        )
+        facts = derive_comparison_facts(
+            comparison,
+            badcases,
+            self.repository.list_traces(baseline_run.id),
+            self.repository.list_traces(candidate_run.id),
+            expected_case_ids,
+        )
+        return RunComparisonAnalysis(
+            comparison=comparison,
+            tag_deltas=compare_result_breakdowns(
+                baseline_analytics.by_tag,
+                candidate_analytics.by_tag,
+            ),
+            failure_type_deltas=compare_result_breakdowns(
+                baseline_analytics.by_failure_type,
+                candidate_analytics.by_failure_type,
+            ),
+            badcases=badcases,
+            facts=facts,
+        )
+
+    def get_comparison_gate_defaults(self) -> ComparisonGateSpec:
+        """Return the service-owned default A/B comparison rules."""
+
+        return default_comparison_gate_spec()
+
+    def evaluate_comparison_gate(
+        self,
+        baseline_run_id: str,
+        candidate_run_id: str,
+        spec: ComparisonGateSpec,
+    ) -> ComparisonGateDecision:
+        """Evaluate submitted rules against facts derived from two Runs."""
+
+        analysis = self.analyze_runs(baseline_run_id, candidate_run_id)
+        return decide_comparison_gate(spec, analysis.facts)
 
     def get_trace(self, run_id: str, case_id: str) -> Trace:
         self._get_run(run_id)

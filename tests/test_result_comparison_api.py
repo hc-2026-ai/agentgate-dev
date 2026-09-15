@@ -221,6 +221,8 @@ def test_compare_completed_runs(tmp_path) -> None:
     assert body["candidate_target_version"] == "loan-agent-v2-fixed"
     assert body["overall_score_delta"] > 0
     assert any(item["change"] == "improvement" for item in body["case_deltas"])
+    assert "facts" not in body
+    assert "badcases" not in body
 
 
 def test_unknown_comparison_run_returns_not_found(tmp_path) -> None:
@@ -285,3 +287,241 @@ def test_incompatible_comparison_runs_return_conflict(tmp_path) -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"] == "reports use different primary Evaluators"
+
+
+def test_get_complete_run_comparison_analysis(tmp_path) -> None:
+    application = create_app(tmp_path / "comparison-analysis-api.db")
+    dependencies = application.state.dependencies
+    baseline = dependencies.execute_demo_run("loan-agent-v1-risky")
+    candidate = dependencies.execute_demo_run("loan-agent-v2-fixed")
+
+    with TestClient(application) as client:
+        response = client.get(
+            "/api/run-comparisons/analysis",
+            params={
+                "baseline_run_id": baseline.id,
+                "candidate_run_id": candidate.id,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["comparison"]["baseline_run_id"] == baseline.id
+    assert body["comparison"]["candidate_run_id"] == candidate.id
+    assert all(item["dimension"] == "tag" for item in body["tag_deltas"])
+    assert all(
+        item["dimension"] == "failure_type"
+        for item in body["failure_type_deltas"]
+    )
+    assert set(body["badcases"]) == {
+        "baseline_case_ids",
+        "candidate_case_ids",
+        "new_case_ids",
+        "baseline_case_count",
+        "candidate_case_count",
+        "new_case_count",
+    }
+    assert [fact["metric_id"] for fact in body["facts"]] == [
+        "quality.overall_score_delta",
+        "performance.case_latency_p95_change_ratio",
+        "badcase.new_case_count",
+    ]
+
+
+def test_get_comparison_gate_defaults(tmp_path) -> None:
+    application = create_app(tmp_path / "comparison-gate-defaults-api.db")
+
+    with TestClient(application) as client:
+        response = client.get("/api/run-comparisons/gate-defaults")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == "comparison-gate"
+    assert body["version"] == "1"
+    assert [
+        (rule["metric_id"], rule["operator"], rule["threshold"])
+        for rule in body["rules"]
+    ] == [
+        ("quality.overall_score_delta", "gte", -0.02),
+        ("performance.case_latency_p95_change_ratio", "lte", 0.1),
+        ("badcase.new_case_count", "lte", 0.0),
+    ]
+
+
+def test_comparison_gate_business_pass_and_fail_both_return_ok(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application = create_app(tmp_path / "comparison-gate-api.db")
+    dependencies = application.state.dependencies
+    baseline = dependencies.execute_demo_run("loan-agent-v1-risky")
+    candidate = dependencies.execute_demo_run("loan-agent-v2-fixed")
+    passing_payload = {
+        "baseline_run_id": baseline.id,
+        "candidate_run_id": candidate.id,
+        "gate_spec": {
+            "id": "custom-gate",
+            "version": "1",
+            "rules": [
+                {
+                    "metric_id": "quality.overall_score_delta",
+                    "operator": "gte",
+                    "threshold": -1,
+                }
+            ],
+        },
+    }
+
+    with TestClient(application) as client:
+        passed = client.post("/api/run-comparisons/gate", json=passing_payload)
+
+        original_list_traces = dependencies.repository.list_traces
+
+        def missing_candidate_traces(run_id):
+            if run_id == candidate.id:
+                return []
+            return original_list_traces(run_id)
+
+        monkeypatch.setattr(
+            dependencies.repository,
+            "list_traces",
+            missing_candidate_traces,
+        )
+        failing_payload = {
+            **passing_payload,
+            "gate_spec": {
+                "id": "custom-gate",
+                "version": "1",
+                "rules": [
+                    {
+                        "metric_id": "quality.overall_score_delta",
+                        "operator": "gte",
+                        "threshold": 1,
+                    },
+                    {
+                        "metric_id": (
+                            "performance.case_latency_p95_change_ratio"
+                        ),
+                        "operator": "lte",
+                        "threshold": 0.1,
+                    },
+                ],
+            },
+        }
+        failed = client.post("/api/run-comparisons/gate", json=failing_payload)
+
+    assert passed.status_code == 200
+    assert passed.json()["outcome"] == "pass"
+    assert failed.status_code == 200
+    failed_body = failed.json()
+    assert failed_body["outcome"] == "fail"
+    assert [item["status"] for item in failed_body["conditions"]] == [
+        "fail",
+        "unavailable",
+    ]
+    assert failed_body["unmet_conditions"] == failed_body["conditions"]
+
+
+def test_comparison_gate_rejects_unknown_fields_and_invalid_rules(tmp_path) -> None:
+    application = create_app(tmp_path / "comparison-gate-validation-api.db")
+    base = {
+        "baseline_run_id": "baseline",
+        "candidate_run_id": "candidate",
+        "gate_spec": {
+            "rules": [
+                {
+                    "metric_id": "badcase.new_case_count",
+                    "operator": "lte",
+                    "threshold": 0,
+                }
+            ]
+        },
+    }
+
+    with TestClient(application) as client:
+        extra = client.post(
+            "/api/run-comparisons/gate",
+            json={**base, "enabled": True},
+        )
+        invalid = client.post(
+            "/api/run-comparisons/gate",
+            json={
+                **base,
+                "gate_spec": {
+                    "rules": [
+                        {
+                            "metric_id": "badcase.new_case_count",
+                            "operator": "lte",
+                            "threshold": -1,
+                        }
+                    ]
+                },
+            },
+        )
+
+    assert extra.status_code == 422
+    assert invalid.status_code == 422
+
+
+def test_comparison_analysis_and_gate_map_application_errors(tmp_path) -> None:
+    dispatcher = RecordingDispatcher()
+    application = create_app(tmp_path / "comparison-new-errors-api.db", dispatcher)
+    dependencies = application.state.dependencies
+    completed = dependencies.execute_demo_run("loan-agent-v1-risky")
+    pending = dependencies.submit_demo_run("loan-agent-v2-fixed")
+    gate_spec = {
+        "rules": [
+            {
+                "metric_id": "quality.overall_score_delta",
+                "operator": "gte",
+                "threshold": -0.02,
+            }
+        ]
+    }
+
+    with TestClient(application) as client:
+        missing = client.get(
+            "/api/run-comparisons/analysis",
+            params={
+                "baseline_run_id": "missing",
+                "candidate_run_id": completed.id,
+            },
+        )
+        incomplete = client.post(
+            "/api/run-comparisons/gate",
+            json={
+                "baseline_run_id": completed.id,
+                "candidate_run_id": pending.id,
+                "gate_spec": gate_spec,
+            },
+        )
+
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "unknown EvaluationRun: missing"
+    assert incomplete.status_code == 409
+    assert incomplete.json()["detail"] == (
+        "Run comparison analysis requires completed EvaluationRuns"
+    )
+
+
+def test_comparison_openapi_exposes_analysis_and_gate_contracts(tmp_path) -> None:
+    application = create_app(tmp_path / "comparison-openapi.db")
+
+    with TestClient(application) as client:
+        schema = client.get("/openapi.json").json()
+
+    paths = schema["paths"]
+    assert "/api/run-comparisons/analysis" in paths
+    assert "/api/run-comparisons/gate-defaults" in paths
+    assert "/api/run-comparisons/gate" in paths
+    components = schema["components"]["schemas"]
+    assert "RunComparisonAnalysis" in components
+    assert "ComparisonGateSpec" in components
+    assert "ComparisonGateDecision" in components
+    request_schema = components["RunComparisonGateRequest"]
+    assert request_schema["additionalProperties"] is False
+    assert set(request_schema["required"]) == {
+        "baseline_run_id",
+        "candidate_run_id",
+        "gate_spec",
+    }

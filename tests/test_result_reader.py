@@ -19,6 +19,7 @@ from agentgate.demo.targets import (
     get_demo_target_descriptor,
 )
 from agentgate.domain import (
+    ComparisonGateSpec,
     FrozenJsonObject,
     RunStatus,
     TargetSnapshot,
@@ -278,3 +279,143 @@ def test_overview_counts_all_runs_beyond_history_page(tmp_path) -> None:
 
     assert overview["total_runs"] == 51
     assert overview["pending_runs"] == 51
+
+
+def test_reader_assembles_complete_comparison_analysis_without_n_plus_one(
+    tmp_path,
+    execute_demo,
+    monkeypatch,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "comparison-analysis.db")
+    baseline, _ = execute_demo(repository, "loan-agent-v1-risky")
+    candidate, _ = execute_demo(repository, "loan-agent-v2-fixed")
+    original_list_results = repository.list_results
+    original_list_traces = repository.list_traces
+    calls = {"results": [], "traces": [], "get_trace": []}
+
+    def list_results(run_id):
+        calls["results"].append(run_id)
+        return original_list_results(run_id)
+
+    def list_traces(run_id):
+        calls["traces"].append(run_id)
+        return original_list_traces(run_id)
+
+    def get_trace(run_id, case_id):
+        calls["get_trace"].append((run_id, case_id))
+        raise AssertionError("analysis must not query Traces one Case at a time")
+
+    monkeypatch.setattr(repository, "list_results", list_results)
+    monkeypatch.setattr(repository, "list_traces", list_traces)
+    monkeypatch.setattr(repository, "get_trace", get_trace)
+
+    analysis = ResultReader(repository).analyze_runs(baseline.id, candidate.id)
+
+    assert analysis.comparison.baseline_run_id == baseline.id
+    assert analysis.comparison.candidate_run_id == candidate.id
+    assert all(item.dimension == "tag" for item in analysis.tag_deltas)
+    assert all(
+        item.dimension == "failure_type"
+        for item in analysis.failure_type_deltas
+    )
+    assert tuple(fact.metric_id for fact in analysis.facts) == (
+        "quality.overall_score_delta",
+        "performance.case_latency_p95_change_ratio",
+        "badcase.new_case_count",
+    )
+    assert analysis.badcases.new_case_count == len(analysis.badcases.new_case_ids)
+    assert calls == {
+        "results": [baseline.id, candidate.id],
+        "traces": [baseline.id, candidate.id],
+        "get_trace": [],
+    }
+
+
+def test_reader_returns_defaults_without_accessing_repository(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "comparison-defaults.db")
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("default Gate rules must not access persistence")
+
+    monkeypatch.setattr(repository, "get_run", unexpected)
+    monkeypatch.setattr(repository, "list_results", unexpected)
+    monkeypatch.setattr(repository, "list_traces", unexpected)
+
+    spec = ResultReader(repository).get_comparison_gate_defaults()
+
+    assert isinstance(spec, ComparisonGateSpec)
+    assert len(spec.rules) == 3
+
+
+def test_reader_evaluates_comparison_gate_from_analysis_facts(
+    tmp_path,
+    execute_demo,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "comparison-gate.db")
+    baseline, _ = execute_demo(repository, "loan-agent-v1-risky")
+    candidate, _ = execute_demo(repository, "loan-agent-v2-fixed")
+    reader = ResultReader(repository)
+    defaults = reader.get_comparison_gate_defaults()
+    quality_only = ComparisonGateSpec(rules=(defaults.rules[0],))
+
+    decision = reader.evaluate_comparison_gate(
+        baseline.id,
+        candidate.id,
+        quality_only,
+    )
+
+    assert decision.spec == quality_only
+    assert len(decision.conditions) == 1
+    assert decision.conditions[0].metric_id == "quality.overall_score_delta"
+
+
+def test_reader_comparison_analysis_rejects_unknown_and_incomplete_runs(
+    tmp_path,
+    execute_demo,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "comparison-errors.db")
+    completed, _ = execute_demo(repository, "loan-agent-v2-fixed")
+    seed_demo(repository)
+    pending = run_management(repository).create_run(
+        target(), dataset_id=LOAN_DATASET.id
+    )
+    reader = ResultReader(repository)
+
+    with pytest.raises(LookupError, match="unknown EvaluationRun"):
+        reader.analyze_runs("missing", completed.id)
+    with pytest.raises(ValueError, match="completed EvaluationRuns"):
+        reader.analyze_runs(pending.id, completed.id)
+
+
+def test_reader_comparison_analysis_preserves_compatibility_errors(
+    tmp_path,
+    execute_demo,
+    monkeypatch,
+) -> None:
+    repository = SQLiteRepository(tmp_path / "comparison-incompatible.db")
+    baseline, _ = execute_demo(repository, "loan-agent-v1-risky")
+    candidate, _ = execute_demo(repository, "loan-agent-v2-fixed")
+    original_get_run = repository.get_run
+    candidate_ref = candidate.manifest.target.ref.model_copy(
+        update={"external_target_id": "another-agent"}
+    )
+    candidate_target = candidate.manifest.target.model_copy(
+        update={"ref": candidate_ref}
+    )
+    candidate_manifest = candidate.manifest.model_copy(
+        update={"target": candidate_target}
+    )
+    incompatible = candidate.model_copy(update={"manifest": candidate_manifest})
+
+    def get_run(run_id):
+        if run_id == candidate.id:
+            return incompatible
+        return original_get_run(run_id)
+
+    monkeypatch.setattr(repository, "get_run", get_run)
+
+    with pytest.raises(ValueError, match="different Agent or Skill targets"):
+        ResultReader(repository).analyze_runs(baseline.id, candidate.id)
