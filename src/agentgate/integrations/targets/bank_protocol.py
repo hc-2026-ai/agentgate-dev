@@ -97,8 +97,9 @@ def parse_bank_sse(lines: Iterable[str], *, protocol: BankProtocol,
         elif name == "start":
             if not isinstance(payload, dict) or payload.get("request_id", request_id) != request_id:
                 raise TargetExecutionError("protocol_error", "customer request ID mismatch")
-        elif name != "progress":
-            raise TargetExecutionError("protocol_error", "unknown SSE event")
+        else:
+            # Customer streams add auxiliary events such as chat_started and chunk.
+            return
 
     for line in lines:
         size += len(line.encode("utf-8"))
@@ -122,7 +123,15 @@ def parse_bank_sse(lines: Iterable[str], *, protocol: BankProtocol,
     last = messages[-1]
     intent = None
     if protocol == "workflow":
-        endings = [m for m in messages if m.get("node_id") == "end"]
+        endings = [
+            message
+            for message in messages
+            if message.get("node_id") == "end"
+            or (
+                isinstance(message.get("additional_kwargs"), dict)
+                and message["additional_kwargs"].get("node_id") == "end"
+            )
+        ]
         if len(endings) != 1:
             raise TargetExecutionError("protocol_error", "workflow requires one end node")
         additional = endings[0].get("additional_kwargs")

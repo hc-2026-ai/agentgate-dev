@@ -31,6 +31,45 @@ def test_documented_responses(protocol, payload, envelope):
     assert result.request_id == "request"
 
 
+def test_workflow_accepts_customer_auxiliary_events_and_nested_end_node():
+    result = parse_bank_sse(
+        stream([
+            ("chat_started", {
+                "chat_id": "chat-1",
+                "agent_id": "workflow-agent",
+                "agent_version": "1",
+            }),
+            ("chunk", {
+                "content": "",
+                "additional_kwargs": {
+                    "node_id": "intentClassification",
+                    "chunk_position": "last",
+                },
+            }),
+            ("message", {
+                "content": "",
+                "additional_kwargs": {
+                    "node_id": "intentClassification",
+                    "node_output": {"intentID": "0"},
+                },
+            }),
+            ("message", {
+                "content": "",
+                "additional_kwargs": {
+                    "node_id": "end",
+                    "node_output": {"output": "customer answer"},
+                },
+            }),
+            ("done", {"status": "success", "rescode": "FAIAG0000"}),
+        ]),
+        protocol="workflow",
+        wire_format="event_lines",
+        request_id="request",
+    )
+
+    assert result.output == "customer answer"
+
+
 @pytest.mark.parametrize("frames", [[], [("message", {"content": "answer"})],
     [("done", "[DONE]")], [("error", {"message": "password=private"}), ("done", "[DONE]")],
     [("message", {"content": ""}), ("done", "[DONE]")],
