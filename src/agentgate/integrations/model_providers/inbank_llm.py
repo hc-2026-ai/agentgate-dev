@@ -104,7 +104,7 @@ class InbankLLMModelClient:
             raise JudgeModelUnavailable("Inbank LLM provider is unavailable") from exc
 
         latency_ms = (time.monotonic() - started) * 1000
-        LOGGER.debug(
+        LOGGER.info(
             "Inbank LLM Judge response: provider_id=%s, model=%s, latency=%dms, chars=%d",
             self.provider_id,
             self._model_name,

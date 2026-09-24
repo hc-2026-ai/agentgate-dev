@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
 
 
-MAX_RESPONSE_CHARS = 16_000
+MAX_RESPONSE_CHARS = 64_000
 MAX_REASON_CHARS = 600
 MAX_VIOLATIONS = 20
 MAX_CRITERION_CHARS = 200
 MAX_VIOLATION_DETAIL_CHARS = 600
+
+LOGGER = logging.getLogger(__name__)
 
 JudgeVerdict: TypeAlias = Literal["pass", "fail", "review"]
 _VERDICTS = frozenset({"pass", "fail", "review"})
@@ -132,6 +135,11 @@ def _validate_threshold(pass_threshold: float) -> float:
 def parse_verdict(text: str, pass_threshold: float) -> ParsedVerdict:
     """Parse one Judge completion or reject it as invalid evaluator output."""
 
+    LOGGER.info(
+        "Judge parse_verdict input: len=%d, text=%.6000s",
+        len(text) if isinstance(text, str) else -1,
+        text,
+    )
     threshold = _validate_threshold(pass_threshold)
     if not isinstance(text, str):
         raise JudgeContractError("judge response must be text")
