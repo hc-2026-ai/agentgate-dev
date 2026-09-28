@@ -286,7 +286,7 @@ def test_request_uses_defaults_and_redacts_all_selected_material() -> None:
     assert "top-secret" not in sent
     assert "[redacted]" in sent
     assert request.temperature == 0.0
-    assert request.max_output_tokens == 1000
+    assert request.max_output_tokens == 6000
     assert request.timeout_seconds == 60.0
 
 
