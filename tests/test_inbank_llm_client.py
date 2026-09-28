@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from agentgate.evaluator.judge import (
+    JudgeModelInvalidResponse,
     JudgeModelTimeout,
     JudgeModelUnavailable,
     JudgeRequest,
 )
-from agentgate.integrations.model_providers.inbank_llm import InbankLLMModelClient
+from agentgate.integrations.model_providers.inbank_llm import (
+    InbankLLMModelClient,
+    _extract_chunk_text,
+)
 
 
 def _make_request(**kwargs: Any) -> JudgeRequest:
@@ -51,6 +56,41 @@ def _make_client() -> InbankLLMModelClient:
     )
 
 
+def _delta_chunk(content: str | None) -> Any:
+    """One streaming chunk carrying delta text."""
+
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=content),
+                finish_reason=None,
+            )
+        ]
+    )
+
+
+def _finish_chunk(reason: str) -> Any:
+    """One streaming chunk carrying only a finish reason."""
+
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=None),
+                finish_reason=reason,
+            )
+        ]
+    )
+
+
+def _usage_chunk() -> Any:
+    """One usage-only chunk without choices, sent at the end of some streams."""
+
+    return SimpleNamespace(
+        choices=[],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Construction tests
 # ---------------------------------------------------------------------------
@@ -79,7 +119,13 @@ def test_init_raises_importerror_when_sdk_absent(monkeypatch: pytest.MonkeyPatch
 
 
 def test_complete_collects_stream_fragments(monkeypatch: pytest.MonkeyPatch) -> None:
-    chunks = ["Hello", ", ", "World"]
+    chunks = [
+        _delta_chunk("Hello"),
+        _delta_chunk(", "),
+        _delta_chunk("World"),
+        _usage_chunk(),
+        _finish_chunk("stop"),
+    ]
     fake_client = _FakeClient(_MockStream(chunks))
     _patch_build_sdk_client(monkeypatch, fake_client)
 
@@ -95,7 +141,8 @@ def test_complete_collects_stream_fragments(monkeypatch: pytest.MonkeyPatch) -> 
     assert response.output_tokens is None
     assert response.latency_ms is not None
     assert response.latency_ms >= 0
-    assert response.finish_reason is None
+    assert response.finish_reason == "stop"
+    assert response.truncated is False
     assert response.attempt_count == 1
     client.close()
 
@@ -105,7 +152,7 @@ def test_complete_passes_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def fake_create(**kwargs: Any) -> Any:
         captured.update(kwargs)
-        return _MockStream(["ok"])
+        return _MockStream([_delta_chunk("ok"), _finish_chunk("stop")])
 
     fake_client = _FakeClientWithCallback(fake_create)
     _patch_build_sdk_client(monkeypatch, fake_client)
@@ -128,7 +175,7 @@ def test_complete_includes_system_prompt(monkeypatch: pytest.MonkeyPatch) -> Non
 
     def fake_create(**kwargs: Any) -> Any:
         captured.update(kwargs)
-        return _MockStream(["ok"])
+        return _MockStream([_delta_chunk("ok"), _finish_chunk("stop")])
 
     fake_client = _FakeClientWithCallback(fake_create)
     _patch_build_sdk_client(monkeypatch, fake_client)
@@ -172,6 +219,101 @@ def test_complete_raises_unavailable_on_sdk_error(monkeypatch: pytest.MonkeyPatc
 
 
 # ---------------------------------------------------------------------------
+# Stream chunk handling tests
+# ---------------------------------------------------------------------------
+
+
+def test_complete_marks_truncated_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunks = [_delta_chunk("partial answer"), _finish_chunk("length")]
+    fake_client = _FakeClient(_MockStream(chunks))
+    _patch_build_sdk_client(monkeypatch, fake_client)
+
+    client = _make_client()
+    request = _make_request()
+
+    response = client.complete(request)
+
+    assert response.text == "partial answer"
+    assert response.finish_reason == "length"
+    assert response.truncated is True
+    client.close()
+
+
+def test_complete_skips_usage_only_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunks = [_delta_chunk("ok"), _usage_chunk(), _delta_chunk("!"), _finish_chunk("stop")]
+    fake_client = _FakeClient(_MockStream(chunks))
+    _patch_build_sdk_client(monkeypatch, fake_client)
+
+    client = _make_client()
+    request = _make_request()
+
+    response = client.complete(request)
+
+    assert response.text == "ok!"
+    assert response.finish_reason == "stop"
+    client.close()
+
+
+def test_complete_raises_invalid_response_on_empty_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = [_usage_chunk()]
+    fake_client = _FakeClient(_MockStream(chunks))
+    _patch_build_sdk_client(monkeypatch, fake_client)
+
+    client = _make_client()
+    request = _make_request()
+
+    with pytest.raises(JudgeModelInvalidResponse, match="stream without text content"):
+        client.complete(request)
+    client.close()
+
+
+@pytest.mark.parametrize(
+    ("chunk", "expected_text", "expected_reason"),
+    [
+        (_delta_chunk("hello"), "hello", None),
+        (_finish_chunk("stop"), "", "stop"),
+        (_usage_chunk(), "", None),
+        (
+            SimpleNamespace(choices=[SimpleNamespace(delta=None, finish_reason="stop")]),
+            "",
+            "stop",
+        ),
+        (
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(delta=SimpleNamespace(content=None), finish_reason=None)
+                ]
+            ),
+            "",
+            None,
+        ),
+        (
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(delta=SimpleNamespace(content=123), finish_reason=None)
+                ]
+            ),
+            "",
+            None,
+        ),
+        (
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(delta=SimpleNamespace(content="text"), finish_reason=42)
+                ]
+            ),
+            "text",
+            None,
+        ),
+    ],
+)
+def test_extract_chunk_text(chunk: Any, expected_text: str, expected_reason: str | None) -> None:
+    assert _extract_chunk_text(chunk) == (expected_text, expected_reason)
+
+
+# ---------------------------------------------------------------------------
 # close() tests
 # ---------------------------------------------------------------------------
 
@@ -199,16 +341,16 @@ def test_close_silent_when_no_close_method(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 class _MockStream:
-    """Async stream that yields the given fragments."""
+    """Async stream that yields the given chunks."""
 
-    def __init__(self, fragments: list[str]) -> None:
-        self._fragments = list(fragments)
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = list(chunks)
 
     def __aiter__(self) -> _MockStream:
-        self._iter = iter(self._fragments)
+        self._iter = iter(self._chunks)
         return self
 
-    async def __anext__(self) -> str:
+    async def __anext__(self) -> Any:
         try:
             return next(self._iter)
         except StopIteration:

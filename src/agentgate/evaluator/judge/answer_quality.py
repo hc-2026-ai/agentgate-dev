@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -31,6 +32,8 @@ from .model_protocol import (
     request_fingerprint,
 )
 from .prompt import JudgeInputSelection, build_judge_request
+
+LOGGER = logging.getLogger(__name__)
 
 
 _CONFIG_FIELDS = frozenset(
@@ -187,7 +190,7 @@ class _AnswerQualityConfig:
             temperature=temperature,
             seed=seed,
             max_output_tokens=_positive_int(
-                config.get("max_output_tokens", 1000),
+                config.get("max_output_tokens", 6000),
                 "answer-quality config max_output_tokens",
             ),
             timeout_seconds=_positive_number(
@@ -308,6 +311,17 @@ class AnswerQualityJudge:
         for attempt in range(2):
             try:
                 response = client.complete(request)
+                LOGGER.info(
+                    "Judge model response: provider_id=%s, model=%s, attempt=%d, "
+                    "chars=%d, finish_reason=%s, truncated=%s, text=%.6000s",
+                    client.provider_id,
+                    response.resolved_model_id,
+                    attempt,
+                    len(response.text),
+                    response.finish_reason,
+                    response.truncated,
+                    response.text,
+                )
             except Exception as exc:
                 if attempts:
                     exc.judge_record = attempts[-1]

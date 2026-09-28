@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from agentgate.evaluator.judge import (
+    JudgeModelInvalidResponse,
     JudgeModelTimeout,
     JudgeModelUnavailable,
     JudgeRequest,
@@ -27,6 +28,21 @@ def _require_text(value: str, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must not be blank")
     return value.strip()
+
+
+def _extract_chunk_text(chunk: Any) -> tuple[str, str | None]:
+    """Read delta text and finish reason from one OpenAI-style stream chunk."""
+
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
+        return "", None
+    choice = choices[0]
+    delta = getattr(choice, "delta", None)
+    content = getattr(delta, "content", None) if delta is not None else None
+    finish_reason = getattr(choice, "finish_reason", None)
+    text = content if isinstance(content, str) else ""
+    reason = finish_reason if isinstance(finish_reason, str) and finish_reason else None
+    return text, reason
 
 
 class InbankLLMModelClient:
@@ -83,7 +99,9 @@ class InbankLLMModelClient:
         )
         started = time.monotonic()
         try:
-            text = asyncio.run(self._collect_stream(create_kwargs, request.timeout_seconds))
+            text, finish_reason = asyncio.run(
+                self._collect_stream(create_kwargs, request.timeout_seconds)
+            )
         except TimeoutError as exc:
             LOGGER.warning(
                 "Inbank LLM Judge timed out after %gs: provider_id=%s, model=%s",
@@ -104,13 +122,24 @@ class InbankLLMModelClient:
             raise JudgeModelUnavailable("Inbank LLM provider is unavailable") from exc
 
         latency_ms = (time.monotonic() - started) * 1000
-        LOGGER.debug(
-            "Inbank LLM Judge response: provider_id=%s, model=%s, latency=%dms, chars=%d",
+        LOGGER.info(
+            "Inbank LLM Judge response: provider_id=%s, model=%s, latency=%dms, "
+            "chars=%d, finish_reason=%s",
             self.provider_id,
             self._model_name,
             int(latency_ms),
             len(text),
+            finish_reason,
         )
+        if not text.strip():
+            LOGGER.warning(
+                "Inbank LLM Judge stream produced no text: provider_id=%s, model=%s",
+                self.provider_id,
+                self._model_name,
+            )
+            raise JudgeModelInvalidResponse(
+                "Inbank LLM provider returned a stream without text content"
+            )
         return JudgeResponse(
             text=text,
             resolved_model_id=self._model_name,
@@ -118,7 +147,7 @@ class InbankLLMModelClient:
             input_tokens=None,
             output_tokens=None,
             latency_ms=latency_ms,
-            finish_reason=None,
+            finish_reason=finish_reason,
             attempt_count=1,
         )
 
@@ -136,17 +165,23 @@ class InbankLLMModelClient:
         self,
         create_kwargs: dict[str, Any],
         timeout_seconds: float,
-    ) -> str:
-        """Run the async streaming call and collect text fragments."""
+    ) -> tuple[str, str | None]:
+        """Run the async streaming call and collect delta text and finish reason."""
 
         stream = await self._client.chat.completions.create(**create_kwargs)
 
         fragments: list[str] = []
+        finish_reason: str | None = None
         try:
             async with asyncio.timeout(timeout_seconds):
                 async for chunk in stream:
-                    if chunk:
-                        fragments.append(str(chunk))
+                    if not chunk:
+                        continue
+                    content, reason = _extract_chunk_text(chunk)
+                    if content:
+                        fragments.append(content)
+                    if reason:
+                        finish_reason = reason
         finally:
             if hasattr(stream, "aclose"):
                 try:
@@ -154,7 +189,7 @@ class InbankLLMModelClient:
                 except Exception:
                     LOGGER.debug("Inbank LLM stream aclose() failed", exc_info=True)
 
-        return "".join(fragments)
+        return "".join(fragments), finish_reason
 
     def _build_sdk_client(self) -> Any:
         """Import and construct the SDK client; deferred so ``api`` mode never imports."""
