@@ -1,6 +1,19 @@
 # AgentGate Project Progress
 
-Last updated: 2026-09-22
+Last updated: 2026-09-23
+
+## In-bank Trace readiness polling — 2026-09-23
+
+- Added bounded readiness polling in the two existing in-bank adapters, covering base/workflow/Yunxia. Immediate first query, two-second poll delay, stop on readiness without replaying chat; reuse the existing request/Case timeout budget.
+- Per user constraint, `trace_server.py` is unchanged. Transient retrieval failures and recognizable pending evidence retry; permanent errors still fail. Timeout continues to preserve Pod cleanup. No output-only fallback is implemented yet; that behavior and evidence-aware evaluator handling are under discussion.
+- Verification: 317 focused tests passed, 26 skipped, including real local HTTP 404-then-ready checks for all three types. Changed adapter/Trace-test Ruff checks and diff whitespace checks passed. No customer calls, commit or push performed. Readiness does not establish completeness of late LLM uploads without a server watermark.
+
+## In-bank customer-function adaptation — 2026-09-23
+
+- On `feature/inbank-trace-server`, adapted the supplied customer lifecycle and chat functions inside the existing ChatABC and Yunxia modules. Preserved RunEngine, evaluator/report contracts, real Trace Server retrieval, eight-character task IDs, unified Pod deletion and Yunxia branchId/message fixes. No separate lifecycle module or customer Excel/DB main program was introduced.
+- Creation retries three times and ChatABC session initialization retries ten times, stopping at the first success. Customer SSE extraction replaces virtual-bank parsing only in the real in-bank adapters. Responses close on success and failure; health failure still triggers registered Pod cleanup.
+- Verification: 325 focused tests passed, 26 skipped; 51 direct comparisons to isolated original customer functions passed. Full backend: 1596 passed, 52 skipped, 8 failed. All eight BJS launcher failures also reproduce before this change because the workspace lacks `.venv/bin/python`. Changed adapter/contract-test Ruff checks, dependency lock validation and diff whitespace checks passed.
+- `requests` and its dependencies must be included in offline deployments. Local tests do not prove customer-platform acceptance or availability of the required real Trace references. No commit, push or merge performed. See [customer adaptation boundaries](inbank-customer-adaptation.md).
 
 ## Agent platform local acceptance — 2026-09-22
 

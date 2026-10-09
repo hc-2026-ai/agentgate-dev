@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
-import socket
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
-from urllib.error import HTTPError, URLError
+from typing import Any
 from urllib.parse import quote, urlencode, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
-from agentgate.domain import SpanStatus, TargetType, Trace, TraceSpan, utcnow
-from agentgate.integrations.targets.bank_protocol import parse_bank_sse
+import requests
+
+from agentgate.domain import FrozenJsonObject, TargetType, Trace, utcnow
+from agentgate.integrations.observability.trace_sdk import normalize_sdk_exports
+from agentgate.integrations.observability.trace_server import TraceServerClient
 from agentgate.integrations.targets.inbank.diagnostics import (
     business_summary,
     mapping_shape,
@@ -28,155 +29,308 @@ from agentgate.run.target_protocol import (
     CaseExecutionStatus,
     TargetExecutionError,
 )
-from agentgate.trace.redaction import redact_value
-
 
 LOGGER = logging.getLogger(__name__)
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024
-_SUCCESS_CODES = frozenset({"0", "0000"})
 _DELETE_SUCCESS_CODES = frozenset({"0", "0000", "FAIAG0000"})
 
 
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        return None
+# Adapted from customer yunxia.py; AgentGate owns scheduling and reports.
+def _request_failure(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, TargetExecutionError):
+        code = exc.code
+    elif isinstance(exc, requests.exceptions.Timeout):
+        code = "timeout"
+    elif isinstance(exc, requests.exceptions.HTTPError):
+        code = _http_error(exc.response.status_code).code
+    elif isinstance(exc, requests.exceptions.ConnectionError):
+        code = "unavailable"
+    else:
+        code = "protocol_error"
+    return {
+        "success": False,
+        "error_code": code,
+        "error": exc.message
+        if isinstance(exc, TargetExecutionError)
+        else f"customer request failed ({type(exc).__name__})",
+    }
 
 
-class _Transport(Protocol):
-    def request_json(
-        self,
-        method: str,
-        url: str,
-        *,
-        payload: Mapping[str, Any] | None = None,
-        headers: Mapping[str, str] | None = None,
-        timeout: float,
-    ) -> Mapping[str, Any]: ...
+def create_agent_pod(
+    task_id: str,
+    agent_id: str,
+    agent_version: str,
+    cfg: Mapping,
+    is_vip_eval: bool = False,
+    timeout: float = 60,
+    *,
+    http=None,
+    sleep=time.sleep,
+    branch_id: str | None = None,
+) -> dict:
+    http = http or requests
+    query = {"taskId": task_id}
+    if is_vip_eval:
+        query["evalType"] = "formal"
+    url = _url(cfg["CCE_CREATE_BASE_URL"], "/web/agent_endpoint/createAgent", query)
+    body = {"agentId": agent_id, "agentVersion": agent_version}
+    if branch_id is not None and str(branch_id).strip() not in ("", "null", "None"):
+        body["branchId"] = str(branch_id).strip()
 
-    def request_bytes(
-        self,
-        method: str,
-        url: str,
-        *,
-        payload: Mapping[str, Any] | None = None,
-        headers: Mapping[str, str] | None = None,
-        timeout: float,
-    ) -> bytes: ...
-
-
-class _UrlLibTransport:
-    def __init__(self) -> None:
-        self._opener = build_opener(_NoRedirect())
-
-    def request_json(
-        self,
-        method: str,
-        url: str,
-        *,
-        payload: Mapping[str, Any] | None = None,
-        headers: Mapping[str, str] | None = None,
-        timeout: float,
-    ) -> Mapping[str, Any]:
-        raw = self.request_bytes(
-            method,
-            url,
-            payload=payload,
-            headers=headers,
-            timeout=timeout,
-        )
+    def _attempt() -> dict:
         try:
-            value = json.loads(raw)
-        except (UnicodeDecodeError, ValueError):
-            raise TargetExecutionError(
-                "protocol_error", "customer endpoint returned invalid JSON"
-            ) from None
-        if not isinstance(value, dict):
-            raise TargetExecutionError(
-                "protocol_error", "customer endpoint JSON must be an object"
+            with http.post(
+                url, json=body, timeout=timeout, headers={"Content-Type": "application/json"}
+            ) as resp:
+                resp.raise_for_status()
+                data = resp.json()
+            LOGGER.debug(
+                "inbank_http_json adapter=yunxia url=%s %s shape=%s",
+                safe_url(url),
+                business_summary(data),
+                mapping_shape(data),
             )
-        LOGGER.debug(
-            "inbank_http_json adapter=yunxia method=%s url=%s %s shape=%s",
-            method,
-            safe_url(url),
-            business_summary(value),
-            mapping_shape(value),
-        )
+            if str(data.get("code", "")) not in ("0", "0000"):
+                code = str(data.get("code", ""))
+                return {
+                    "success": False,
+                    "error_code": "rejected",
+                    "error": f"code={code}, message={data.get('message', '未知错误')}",
+                    "response": data,
+                }
+            agent_name = data.get("data", {}).get("agentName", "")
+            if not agent_name:
+                return {
+                    "success": False,
+                    "error_code": "protocol_error",
+                    "error": "create Agent Pod returned no agentName",
+                    "response": data,
+                }
+            return {"success": True, "agent_name": agent_name, "response": data}
+        except Exception as exc:  # noqa: BLE001 - retain customer retry/cleanup boundary.
+            return _request_failure(exc)
+
+    for attempt in range(1, 4):
+        result = _attempt()
+        if result["success"]:
+            return result
+        if attempt < 3:
+            LOGGER.warning(
+                "inbank_lifecycle_retry adapter=yunxia phase=create "
+                "attempt=%d max_attempts=3 retry_delay_seconds=10",
+                attempt,
+            )
+            sleep(10)
+    return result
+
+
+def wait_for_pod_ready(
+    agent_name: str,
+    cfg: Mapping,
+    interval: float = 5,
+    max_wait: float = 300,
+    *,
+    http=None,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> bool:
+    http = http or requests
+    url = _url(cfg["HEALTH_CHECK_BASE_URL"], f"/agent-api/{quote(agent_name, safe='')}/health")
+    start = monotonic()
+    while monotonic() - start < max_wait:
+        try:
+            with http.get(url, timeout=10) as resp:
+                resp.raise_for_status()
+                data = resp.json()
+            if isinstance(data, dict) and data.get("status") == "ok":
+                return True
+        except Exception as exc:  # noqa: BLE001 - retain customer retry/cleanup boundary.
+            LOGGER.warning("inbank_health_pending adapter=yunxia error_type=%s", type(exc).__name__)
+        sleep(min(interval, max(0, max_wait - (monotonic() - start))))
+    return False
+
+
+def delete_agent_pod(agent_name: str, cfg: Mapping, timeout: float = 60, *, http=None) -> dict:
+    http = http or requests
+    url = _url(cfg["DELETE_POD_BASE_URL"], "/agent-api/agent-manager/chatabc/delete_agent")
+    body = {
+        "appId": "",
+        "trCode": "",
+        "trVersion": "",
+        "timestamp": 1,
+        "requestId": "",
+        "data": {"agent_name": agent_name, "agent_namespace": cfg["AGENT_NAMESPACE"]},
+    }
+    try:
+        with http.post(
+            url, json=body, timeout=timeout, headers={"Content-Type": "application/json"}
+        ) as resp:
+            resp.raise_for_status()
+            data = resp.json()
+        _require_delete_success(data)
+        return {"success": True, "response": data}
+    except Exception as exc:  # noqa: BLE001 - retain customer retry/cleanup boundary.
+        return _request_failure(exc)
+
+
+def parse_sse_stream(response, deadline: float | None = None) -> list:
+    events = []
+    current_event = None
+    current_data_lines = []
+    size = 0
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if deadline is not None and time.time() > deadline:
+            raise requests.exceptions.Timeout("SSE exceeded deadline")
+        if raw_line is None:
+            continue
+        size += len(raw_line.encode("utf-8"))
+        if size > _MAX_RESPONSE_BYTES:
+            raise TargetExecutionError("protocol_error", "customer response exceeds 10 MiB")
+        line = raw_line.strip()
+        if not line:
+            if current_event is not None and current_data_lines:
+                events.append({"event": current_event, "data": "\n".join(current_data_lines)})
+            current_event, current_data_lines = None, []
+            continue
+        if line.startswith("event:"):
+            current_event = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            current_data_lines.append(line[len("data:") :].strip())
+        else:
+            current_data_lines.append(line)
+    if current_event is not None and current_data_lines:
+        events.append({"event": current_event, "data": "\n".join(current_data_lines)})
+    return events
+
+
+def safe_json_loads(value):
+    if value is None or isinstance(value, (dict, list, int, float, bool)):
         return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return str(value)
 
-    def request_bytes(
-        self,
-        method: str,
-        url: str,
-        *,
-        payload: Mapping[str, Any] | None = None,
-        headers: Mapping[str, str] | None = None,
-        timeout: float,
-    ) -> bytes:
-        body = None
-        request_headers = dict(headers or {})
-        if payload is not None:
-            body = json.dumps(
-                payload, ensure_ascii=False, allow_nan=False
-            ).encode("utf-8")
-            request_headers.setdefault("Content-Type", "application/json")
-        request = Request(url, data=body, headers=request_headers, method=method)
-        started = time.monotonic()
-        LOGGER.debug(
-            "inbank_http_request adapter=yunxia method=%s url=%s timeout_seconds=%.3f "
-            "payload_%s header_names=%r",
-            method,
-            safe_url(url),
-            timeout,
-            mapping_shape(payload),
-            sorted(request_headers),
-        )
-        try:
-            with self._opener.open(request, timeout=timeout) as response:
-                raw = response.read(_MAX_RESPONSE_BYTES + 1)
-        except HTTPError as exc:
-            LOGGER.error(
-                "inbank_http_failure adapter=yunxia method=%s url=%s "
-                "status_code=%s elapsed_ms=%.1f error_type=HTTPError",
-                method,
-                safe_url(url),
-                exc.code,
-                (time.monotonic() - started) * 1000,
+
+def try_parse_json(data_str: str) -> tuple:
+    try:
+        return True, json.loads(data_str)
+    except (TypeError, ValueError):
+        return False, "invalid JSON"
+
+
+def build_request_payload(row: Mapping, cfg: Mapping) -> dict:
+    """Customer row mapping, fed by Case/Turn instead of a pandas Series."""
+    txt = str(row.get("user_input", "")).strip()
+    session_id = str(row.get("questionId", "")).strip()
+    raw_history = row.get("currentDisplay_1")
+    if isinstance(raw_history, str):
+        raw_history = raw_history.strip()
+    parsed = safe_json_loads(raw_history) if raw_history is not None and raw_history != "" else None
+    app_history = parsed if isinstance(parsed, list) else [] if parsed is None else [parsed]
+    run_uuid = str(cfg.get("_RUN_CUST_UUID") or cfg.get("EVAL_CUST_ID", ""))
+    customer_id = str(row.get("custId") or "").strip()
+    return {
+        "sessionId": session_id,
+        "custID": (customer_id or session_id) + run_uuid,
+        "txt": txt,
+        "executionMode": "execute",
+        "stream": True,
+        "debugTrace": True,
+        "appHistory": app_history,
+        "config_variables": row.get("config_variables", []),
+    }
+
+
+def call_api_via_pod(
+    payload: dict,
+    agent_name: str,
+    cfg: Mapping,
+    timeout: float | None = None,
+    *,
+    http=None,
+    headers=None,
+) -> tuple:
+    http = http or requests
+    if timeout is None:
+        timeout = cfg.get("EVAL_REQUEST_TIMEOUT", 180)
+    url = _url(cfg["POD_API_BASE_URL"], f"/agent-api/{quote(agent_name, safe='')}/api/v1/message")
+    start = time.time()
+    try:
+        with http.post(
+            url,
+            json=payload,
+            stream=True,
+            timeout=timeout,
+            headers={"Content-Type": "application/json", **(headers or {})},
+        ) as resp:
+            resp.raise_for_status()
+            resp.encoding = "utf-8-sig"
+            events = parse_sse_stream(resp, deadline=start + timeout)
+        return events, "", time.time() - start
+    except Exception as exc:  # noqa: BLE001 - retain customer retry/cleanup boundary.
+        failure = _request_failure(exc)
+        return [], f"{failure['error_code']}: {failure['error']}", time.time() - start
+
+
+def process_single_row(
+    row: Mapping,
+    agent_name: str,
+    cfg: Mapping,
+    *,
+    timeout: float | None = None,
+    http=None,
+    headers=None,
+) -> dict:
+    """Customer message/error/trace handling without Excel or its scoring result model."""
+    payload = build_request_payload(row, cfg)
+    events, error, duration = call_api_via_pod(
+        payload, agent_name, cfg, timeout, http=http, headers=headers
+    )
+    message = {}
+    message_data = ""
+    unstructured_output = ""
+    trace_payloads = []
+    # Customer yunxia.py ignores done and does not infer errors from message fields.
+    for ev in events:
+        event_type = ev.get("event", "").strip().lower()
+        data_str = ev.get("data", "")
+        if event_type == "message" and not error:
+            message_data = data_str
+            ok, parsed = try_parse_json(data_str)
+            message = parsed if ok and isinstance(parsed, dict) else {}
+            if ok and isinstance(parsed, dict):
+                unstructured_output = ""
+            elif ok and isinstance(parsed, str):
+                unstructured_output = parsed
+            else:
+                unstructured_output = data_str
+        elif event_type in {"error", "failed"}:
+            ok, parsed = try_parse_json(data_str)
+            detail = (
+                parsed.get("message") or parsed.get("errorCode")
+                if ok and isinstance(parsed, dict)
+                else None
             )
-            raise _http_error(exc.code) from None
-        except (TimeoutError, socket.timeout):
-            LOGGER.error(
-                "inbank_http_failure adapter=yunxia method=%s url=%s "
-                "elapsed_ms=%.1f error_type=TimeoutError",
-                method,
-                safe_url(url),
-                (time.monotonic() - started) * 1000,
-            )
-            raise TargetExecutionError("timeout", "customer endpoint timed out") from None
-        except (URLError, OSError):
-            LOGGER.error(
-                "inbank_http_failure adapter=yunxia method=%s url=%s "
-                "elapsed_ms=%.1f error_type=ConnectionError",
-                method,
-                safe_url(url),
-                (time.monotonic() - started) * 1000,
-            )
-            raise TargetExecutionError(
-                "unavailable", "customer endpoint is unavailable"
-            ) from None
-        LOGGER.debug(
-            "inbank_http_response adapter=yunxia method=%s url=%s "
-            "status_code=%s response_bytes=%d elapsed_ms=%.1f",
-            method,
-            safe_url(url),
-            getattr(response, "status", None),
-            len(raw),
-            (time.monotonic() - started) * 1000,
-        )
-        if len(raw) > _MAX_RESPONSE_BYTES:
-            raise TargetExecutionError(
-                "protocol_error", "customer response exceeds 10 MiB"
-            )
-        return raw
+            failure_detail = detail or data_str or "customer chat returned an error event"
+            error = f"rejected: {str(failure_detail)[:500]}"
+        elif event_type == "trace":
+            ok, parsed = try_parse_json(data_str)
+            trace_payloads.append(parsed if ok else None)
+    output = message.get("message")
+    if not isinstance(output, str) or not output.strip():
+        output = message.get("output", "")
+    if not isinstance(output, str) or not output.strip():
+        output = unstructured_output
+    return {
+        "output": output if isinstance(output, str) else "",
+        "message": message,
+        "message_data": message_data,
+        "events": events,
+        "trace_payloads": tuple(trace_payloads),
+        "error": error,
+        "duration": duration,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,12 +383,21 @@ class InbankYunxiaTargetAdapter:
         self,
         settings: YunxiaSettings,
         *,
-        transport: _Transport | None = None,
+        http: Any = None,
+        trace_client: TraceServerClient | None = None,
         sleep: Any = time.sleep,
         monotonic: Any = time.monotonic,
     ) -> None:
         self.settings = settings
-        self._transport = transport or _UrlLibTransport()
+        self._http = http or requests
+        self._cfg = {
+            "CCE_CREATE_BASE_URL": settings.create_base_url,
+            "HEALTH_CHECK_BASE_URL": settings.health_base_url,
+            "POD_API_BASE_URL": settings.pod_api_base_url,
+            "DELETE_POD_BASE_URL": settings.delete_base_url,
+            "AGENT_NAMESPACE": settings.agent_namespace,
+        }
+        self._trace_server = trace_client or TraceServerClient()
         self._sleep = sleep
         self._monotonic = monotonic
         self._run_id: str | None = None
@@ -354,29 +517,12 @@ class InbankYunxiaTargetAdapter:
             return
         self._pod_lifecycle["delete"] = "started"
         try:
-            response = self._transport.request_json(
-                "POST",
-                _url(
-                    self.settings.delete_base_url,
-                    "/agent-api/agent-manager/chatabc/delete_agent",
-                ),
-                payload={
-                    "appId": "",
-                    "trCode": "",
-                    "trVersion": "",
-                    "timestamp": 1,
-                    "requestId": "",
-                    "data": {
-                        "agent_name": agent_name,
-                        "agent_namespace": self.settings.agent_namespace,
-                    },
-                },
-                timeout=self.settings.request_timeout_seconds,
-            )
-            _require_delete_success(response)
+            result = delete_agent_pod(agent_name, self._cfg, http=self._http)
+            if not result["success"]:
+                raise TargetExecutionError(result["error_code"], result["error"])
             self._pod_lifecycle["delete"] = "succeeded"
             self._log_pod_lifecycle("delete", "succeeded")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the Run failure.
             self._pod_lifecycle["delete"] = "failed"
             self._cleanup_error_type = type(exc).__name__
             LOGGER.warning(
@@ -389,9 +535,7 @@ class InbankYunxiaTargetAdapter:
 
     def _ensure_pod(self, request: CaseExecutionRequest) -> None:
         if self._run_id is not None and self._run_id != request.run_id:
-            raise TargetExecutionError(
-                "invalid_request", "adapter already belongs to another Run"
-            )
+            raise TargetExecutionError("invalid_request", "adapter already belongs to another Run")
         if self._agent_name is not None:
             return
         self._run_id = request.run_id
@@ -402,41 +546,23 @@ class InbankYunxiaTargetAdapter:
             "agent_version", request.target.ref.external_version_id
         )
         if not isinstance(version, str) or not version.strip():
-            raise TargetExecutionError(
-                "invalid_request", "target agent_version must be nonblank"
-            )
+            raise TargetExecutionError("invalid_request", "target agent_version must be nonblank")
         self._pod_lifecycle["create"] = "started"
-        try:
-            response = self._transport.request_json(
-                "POST",
-                _url(
-                    self.settings.create_base_url,
-                    "/web/agent_endpoint/createAgent",
-                    {"taskId": customer_task_id},
-                ),
-                payload={
-                    "agentId": request.target.ref.external_target_id,
-                    "agentVersion": version,
-                    "branchId": branch_id,
-                },
-                timeout=min(
-                    request.timeout_seconds, self.settings.request_timeout_seconds
-                ),
-            )
-            if str(response.get("code", "")) not in _SUCCESS_CODES:
-                raise TargetExecutionError("rejected", "create Agent Pod was rejected")
-            data = response.get("data")
-            agent_name = data.get("agentName") if isinstance(data, Mapping) else None
-            if not isinstance(agent_name, str) or not agent_name.strip():
-                raise TargetExecutionError(
-                    "protocol_error", "create Agent Pod returned no agentName"
-                )
-        except Exception:
+        result = create_agent_pod(
+            customer_task_id,
+            request.target.ref.external_target_id,
+            version,
+            self._cfg,
+            branch_id=branch_id,
+            http=self._http,
+            sleep=self._sleep,
+        )
+        if not result["success"]:
             self._pod_lifecycle["create"] = "failed"
             self._log_pod_lifecycle("create", "failed")
-            raise
-        self._agent_name = agent_name
-        self._pod_name = agent_name
+            raise TargetExecutionError(result["error_code"], result["error"])
+        self._agent_name = result["agent_name"]
+        self._pod_name = self._agent_name
         self._pod_lifecycle["create"] = "succeeded"
         self._log_pod_lifecycle("create", "succeeded")
         self._pod_lifecycle["health"] = "started"
@@ -451,88 +577,40 @@ class InbankYunxiaTargetAdapter:
 
     def _wait_until_healthy(self, case_timeout_seconds: float) -> None:
         assert self._agent_name is not None
-        wait_seconds = min(case_timeout_seconds, self.settings.health_wait_seconds)
-        deadline = self._monotonic() + wait_seconds
-        url = _url(
-            self.settings.health_base_url,
-            f"/agent-api/{quote(self._agent_name, safe='')}/health",
-        )
-        last_error: TargetExecutionError | None = None
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                response = self._transport.request_json(
-                    "GET",
-                    url,
-                    headers=self._pod_headers(),
-                    timeout=min(
-                        self.settings.request_timeout_seconds,
-                        max(0.001, deadline - self._monotonic()),
-                    ),
-                )
-                if response.get("status") == "ok":
-                    LOGGER.info(
-                        "inbank_health_ready adapter=yunxia run_id=%r "
-                        "pod_name=%r attempt=%d",
-                        self._run_id,
-                        self._pod_name,
-                        attempt,
-                    )
-                    return
-                LOGGER.debug(
-                    "inbank_health_pending adapter=yunxia run_id=%r "
-                    "pod_name=%r attempt=%d",
-                    self._run_id,
-                    self._pod_name,
-                    attempt,
-                )
-                last_error = None
-            except TargetExecutionError as exc:
-                if exc.code == "unauthorized":
-                    raise
-                last_error = exc
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                detail = " after endpoint failures" if last_error else ""
-                raise TargetExecutionError(
-                    "timeout", f"Yunxia Pod health check timed out{detail}"
-                )
-            self._sleep(min(self.settings.health_poll_interval_seconds, remaining))
+        if not wait_for_pod_ready(
+            self._agent_name,
+            self._cfg,
+            self.settings.health_poll_interval_seconds,
+            min(case_timeout_seconds, self.settings.health_wait_seconds),
+            http=self._http,
+            sleep=self._sleep,
+            monotonic=self._monotonic,
+        ):
+            raise TargetExecutionError("timeout", "Yunxia Pod health check timed out")
 
     def _execute_case(self, request: CaseExecutionRequest) -> CaseExecutionResult:
         assert self._agent_name is not None
         assert self._run_customer_suffix is not None
         initial = request.case.initial_state.to_dict()
-        session_id = str(uuid4())
-        customer_id = (
-            initial.get("customer_id", self.settings.test_customer_prefix)
-            + "-"
-            + self._run_customer_suffix
+        session_id = request.case.id
+        customer_id = initial.get(
+            "customer_id", f"{self.settings.test_customer_prefix}-{request.case.id}"
         )
-        config_variables = initial.get("config_variables", [])
+        cfg = {**self._cfg, "_RUN_CUST_UUID": "-" + self._run_customer_suffix}
         input_field = _input_field(request)
-        trace_id = request.traceparent.split("-")[1]
-        parent_span_id = request.traceparent.split("-")[2]
-        spans: list[TraceSpan] = []
+        exports: dict[str, tuple[str, bytes]] = {}
         outcomes: dict[str, dict[str, Any]] = {}
-        final_output: dict[str, Any] = {}
-        path = (
-            f"/agent-api/{quote(self._agent_name, safe='')}/api/v1/message"
-        )
+        project_id: str | None = None
 
         for sequence, turn in enumerate(request.case.turns):
             turn_input = turn.input.to_dict()
             request_id = str(uuid4())
-            payload = {
-                "sessionId": session_id,
-                "custID": customer_id,
-                "txt": turn_input[input_field],
-                "executionMode": "execute",
-                "stream": True,
-                "debugTrace": False,
-                "config_variables": config_variables,
-                "appHistory": turn_input.get("app_history", []),
+            row = {
+                "questionId": session_id,
+                "custId": customer_id,
+                "user_input": turn_input[input_field],
+                "currentDisplay_1": turn_input.get("app_history", []),
+                "config_variables": initial.get("config_variables", []),
             }
             started_at = utcnow()
             LOGGER.info(
@@ -546,34 +624,17 @@ class InbankYunxiaTargetAdapter:
                 session_id,
                 len(turn_input[input_field]),
             )
-            raw = self._transport.request_bytes(
-                "POST",
-                _url(self.settings.pod_api_base_url, path),
-                payload=payload,
+            chat = process_single_row(
+                row,
+                self._agent_name,
+                cfg,
+                timeout=min(request.timeout_seconds, self.settings.request_timeout_seconds),
+                http=self._http,
                 headers=self._pod_headers(
-                    request.traceparent,
-                    accept="text/event-stream",
-                    request_id=request_id,
-                ),
-                timeout=min(
-                    request.timeout_seconds, self.settings.request_timeout_seconds
+                    request.traceparent, accept="text/event-stream", request_id=request_id
                 ),
             )
-            try:
-                try:
-                    decoded = raw.decode("utf-8-sig")
-                except UnicodeDecodeError:
-                    raise TargetExecutionError(
-                        "protocol_error", "Yunxia stream is not UTF-8"
-                    ) from None
-                chat = parse_bank_sse(
-                    decoded.splitlines(keepends=True),
-                    protocol="cloudshrimp",
-                    wire_format="event_lines",
-                    request_id=request_id,
-                    session_id=session_id,
-                )
-            except TargetExecutionError:
+            if chat["error"]:
                 if self.settings.debug_sse_failures:
                     LOGGER.error(
                         "inbank_sse_failure adapter=yunxia run_id=%r case_id=%r "
@@ -583,28 +644,57 @@ class InbankYunxiaTargetAdapter:
                         turn.id,
                         request_id,
                         session_id,
-                        decoded[:8192],
+                        json.dumps(chat["events"], ensure_ascii=False)[:8192],
                     )
-                raise
+                code, _, detail = chat["error"].partition(": ")
+                raise TargetExecutionError(code, detail)
+            turn_project_id, source_trace_id = _trace_reference(chat["trace_payloads"])
+            if project_id is None:
+                project_id = turn_project_id
+            elif project_id != turn_project_id:
+                raise TargetExecutionError(
+                    "protocol_error",
+                    "Yunxia turns referenced different Trace Server projects",
+                )
+            if any(source_trace_id == source for source, _ in exports.values()):
+                raise TargetExecutionError(
+                    "protocol_error",
+                    "each Yunxia turn must reference a distinct Trace Server trace",
+                )
+            events = self._fetch_trace_events(
+                turn_project_id,
+                source_trace_id,
+                timeout=min(request.timeout_seconds, self.settings.request_timeout_seconds),
+            )
+            exports[turn.id] = (
+                source_trace_id,
+                "\n".join(
+                    json.dumps(event, ensure_ascii=False, allow_nan=False) for event in events
+                ).encode("utf-8"),
+            )
             ended_at = utcnow()
             final_output = {
-                "output": chat.output,
-                "intent_code": chat.intent_code,
-                "slots": dict(chat.slots),
-                "workflow_calls": list(chat.workflow_calls),
+                "output": chat["output"],
+                "intent_code": chat["message"].get("intent_code"),
+                "slots": chat["message"].get("slots", {}),
+                "workflow_calls": chat["message"].get("workflow_calls", []),
             }
             LOGGER.info(
                 "inbank_turn_complete adapter=yunxia run_id=%r case_id=%r "
                 "turn_id=%r sequence=%d request_id=%r response_bytes=%d "
-                "output_chars=%d workflow_call_count=%d elapsed_ms=%.1f",
+                "output_chars=%d workflow_call_count=%d trace_project_id=%r "
+                "source_trace_id=%r trace_event_count=%d elapsed_ms=%.1f",
                 request.run_id,
                 request.case.id,
                 turn.id,
                 sequence,
                 request_id,
-                len(raw),
-                len(chat.output),
-                len(chat.workflow_calls),
+                len(json.dumps(chat["events"]).encode("utf-8")),
+                len(chat["output"]),
+                len(final_output["workflow_calls"]),
+                turn_project_id,
+                source_trace_id,
+                len(events),
                 (ended_at - started_at).total_seconds() * 1000,
             )
             outcomes[turn.id] = {
@@ -612,47 +702,117 @@ class InbankYunxiaTargetAdapter:
                 "output": final_output,
                 "state": {},
             }
-            spans.append(
-                TraceSpan(
-                    trace_id=trace_id,
-                    span_id=uuid4().hex[:16],
-                    parent_span_id=parent_span_id,
-                    name="inbank.yunxia.turn",
-                    operation_type="turn",
-                    sequence=sequence,
-                    started_at=started_at,
-                    ended_at=ended_at,
-                    status=SpanStatus.OK,
-                    attributes={
-                        "agentgate.turn.id": turn.id,
-                        "inbank.session_id": session_id,
-                        "inbank.request_id": request_id,
-                        "inbank.customer_id": customer_id,
-                        "inbank.intent_code": chat.intent_code,
-                        "inbank.slots": redact_value(chat.slots),
-                        "inbank.workflow_calls": redact_value(chat.workflow_calls),
-                        "inbank.evidence_mode": "output_only",
-                        "inbank.pod_created": True,
-                        "inbank.pod_healthy": True,
-                    },
-                )
-            )
 
-        trace = Trace(
-            trace_id=trace_id,
-            run_id=request.run_id,
-            case_id=request.case.id,
-            spans=tuple(spans),
-            turn_outcomes=outcomes,
-            final_output=final_output,
-            final_state={},
+        assert project_id is not None
+        try:
+            trace = normalize_sdk_exports(request, exports, project_id=project_id)
+        except ValueError:
+            raise TargetExecutionError(
+                "protocol_error", "Trace Server evidence is invalid"
+            ) from None
+        final = outcomes[request.case.turns[-1].id]
+        trace = trace.model_copy(
+            update={
+                "spans": tuple(
+                    span.model_copy(
+                        update={
+                            "attributes": FrozenJsonObject(
+                                {
+                                    **span.attributes.to_dict(),
+                                    "trace_sdk.replay": False,
+                                    "inbank.evidence_mode": "trace_server",
+                                }
+                            )
+                        }
+                    )
+                    if span.operation_type == "turn"
+                    else span
+                    for span in trace.spans
+                ),
+                "turn_outcomes": FrozenJsonObject(outcomes),
+                "final_output": FrozenJsonObject(final["output"]),
+                "final_state": FrozenJsonObject(final["state"]),
+            }
         )
-        return CaseExecutionResult(request.execution_id, trace_id, trace)
+        return CaseExecutionResult(request.execution_id, trace.trace_id, trace)
+
+    def _fetch_trace_events(self, project_id: str, trace_id: str, *, timeout: float) -> list[dict]:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise TargetExecutionError(
+                "invalid_request", "Trace wait timeout must be finite and positive"
+            )
+        deadline = self._monotonic() + timeout
+        attempt = 0
+        reason = "not_queried"
+        while (remaining := deadline - self._monotonic()) > 0:
+            attempt += 1
+            try:
+                # The unchanged client makes two sequential HTTP requests.
+                events = self._trace_server.fetch_events(
+                    project_id, trace_id, timeout=remaining / 2
+                )
+            except TargetExecutionError as exc:
+                if exc.code not in {"unavailable", "timeout"} and not (
+                    exc.code == "rejected"
+                    and exc.message
+                    in {"trace server HTTP 404", "trace server HTTP 409", "trace server HTTP 429"}
+                ):
+                    raise
+                reason = exc.code
+            else:
+                if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
+                    raise TargetExecutionError("protocol_error", "Trace Server evidence is invalid")
+                roots = [e for e in events if e.get("event_type") == "trace"]
+                if len(roots) != 1 or any(
+                    e.get("project_id") != project_id or e.get("trace_id") != trace_id
+                    for e in events
+                ):
+                    raise TargetExecutionError("protocol_error", "Trace Server evidence is invalid")
+                root = roots[0]
+                spans = [e for e in events if e.get("event_type") == "span"]
+                status = root.get("status")
+                count = root.get("span_count")
+                pending = status in ("pending", "running") or (
+                    status == "success"
+                    and (
+                        root.get("output") is None
+                        or root.get("duration_ms") is None
+                        or (isinstance(count, int) and count > len(spans))
+                        or any(e.get("status") in ("pending", "running") for e in spans)
+                    )
+                )
+                if not pending:
+                    if self._monotonic() >= deadline:
+                        break
+                    LOGGER.debug(
+                        "inbank_trace_ready adapter=yunxia run_id=%r source_trace_id=%r attempt=%d",
+                        self._run_id,
+                        trace_id,
+                        attempt,
+                    )
+                    return events
+                reason = "evidence_pending"
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                break
+            delay = min(2.0, remaining)
+            LOGGER.info(
+                "inbank_trace_wait adapter=yunxia run_id=%r source_trace_id=%r "
+                "attempt=%d reason=%s retry_delay_seconds=%.3f",
+                self._run_id,
+                trace_id,
+                attempt,
+                reason,
+                delay,
+            )
+            self._sleep(delay)
+        raise TargetExecutionError(
+            "timeout", f"Trace Server evidence not ready within {timeout:g}s ({reason})"
+        )
 
     def _log_pod_lifecycle(self, phase: str, status: str) -> None:
         LOGGER.info(
-            "inbank_pod_lifecycle adapter=yunxia run_id=%r pod_name=%r "
-            "phase=%s status=%s",
+            "inbank_pod_lifecycle adapter=yunxia run_id=%r pod_name=%r phase=%s status=%s",
             self._run_id,
             self._pod_name,
             phase,
@@ -678,15 +838,11 @@ class InbankYunxiaTargetAdapter:
     def _validate_request(self, request: CaseExecutionRequest) -> None:
         target = request.target
         if target.ref.target_type is not TargetType.AGENT:
-            raise TargetExecutionError(
-                "invalid_request", "Yunxia target must be an Agent"
-            )
+            raise TargetExecutionError("invalid_request", "Yunxia target must be an Agent")
         if target.adapter_type != self.adapter_type:
             raise TargetExecutionError("invalid_request", "adapter_type does not match")
         if target.adapter_version != self.adapter_version:
-            raise TargetExecutionError(
-                "invalid_request", "adapter_version does not match"
-            )
+            raise TargetExecutionError("invalid_request", "adapter_version does not match")
         _branch_id(request)
         initial = request.case.initial_state.to_dict()
         if set(initial) - {"customer_id", "config_variables"}:
@@ -709,44 +865,27 @@ class InbankYunxiaTargetAdapter:
         input_field = _input_field(request)
         for turn in request.case.turns:
             value = turn.input.to_dict()
-            if (
-                set(value) - {input_field, "app_history", "files"}
-                or input_field not in value
-            ):
+            if set(value) - {input_field, "app_history", "files"} or input_field not in value:
                 raise TargetExecutionError(
                     "invalid_request",
-                    "Yunxia CaseTurn input supports only "
-                    f"{input_field}, app_history and files",
+                    f"Yunxia CaseTurn input supports only {input_field}, app_history and files",
                 )
-            if (
-                not isinstance(value[input_field], str)
-                or not value[input_field].strip()
-            ):
+            if not isinstance(value[input_field], str) or not value[input_field].strip():
                 raise TargetExecutionError(
                     "invalid_request",
                     f"CaseTurn {input_field} must be nonblank text",
                 )
-            if not isinstance(value.get("app_history", []), list):
-                raise TargetExecutionError(
-                    "invalid_request", "CaseTurn app_history must be an array"
-                )
             files = value.get("files", [])
             if not isinstance(files, list):
-                raise TargetExecutionError(
-                    "invalid_request", "CaseTurn files must be an array"
-                )
+                raise TargetExecutionError("invalid_request", "CaseTurn files must be an array")
             if files:
-                raise TargetExecutionError(
-                    "invalid_request", "non-empty files are not supported"
-                )
+                raise TargetExecutionError("invalid_request", "non-empty files are not supported")
 
 
 def _input_field(request: CaseExecutionRequest) -> str:
     value = request.target.invocation_config.get("input_field", "txt")
     if not isinstance(value, str) or not value.strip():
-        raise TargetExecutionError(
-            "invalid_request", "target input_field must be nonblank text"
-        )
+        raise TargetExecutionError("invalid_request", "target input_field must be nonblank text")
     return value
 
 
@@ -757,25 +896,40 @@ def _branch_id(request: CaseExecutionRequest) -> str:
         or not value.strip()
         or value.strip().casefold() in {"null", "none"}
     ):
-        raise TargetExecutionError(
-            "invalid_request", "Yunxia target branch_id is required"
-        )
+        raise TargetExecutionError("invalid_request", "Yunxia target branch_id is required")
     return value.strip()
 
 
-def resolve_yunxia_trace(
-    request: CaseExecutionRequest, result: CaseExecutionResult
-) -> Trace:
-    """Return the output-only AgentGate execution record for evaluation."""
+def _trace_reference(payloads: tuple[Any, ...]) -> tuple[str, str]:
+    if len(payloads) != 1 or not isinstance(payloads[0], Mapping):
+        raise TargetExecutionError(
+            "protocol_error",
+            "Yunxia stream must reference exactly one Trace Server trace",
+        )
+    project_id = payloads[0].get("project_id")
+    trace_id = payloads[0].get("trace_id")
+    if (
+        not isinstance(project_id, str)
+        or not project_id.strip()
+        or not isinstance(trace_id, str)
+        or not trace_id.strip()
+    ):
+        raise TargetExecutionError(
+            "protocol_error",
+            "Yunxia trace reference must contain project_id and trace_id",
+        )
+    return project_id.strip(), trace_id.strip()
+
+
+def resolve_yunxia_trace(request: CaseExecutionRequest, result: CaseExecutionResult) -> Trace:
+    """Return the Trace Server-backed execution record for evaluation."""
 
     if result.execution_id != request.execution_id:
         raise TargetExecutionError(
             "protocol_error", "Yunxia result execution does not match request"
         )
     if result.inline_trace is None:
-        raise TargetExecutionError(
-            "protocol_error", "Yunxia execution returned no inline Trace"
-        )
+        raise TargetExecutionError("protocol_error", "Yunxia execution returned no inline Trace")
     return result.inline_trace
 
 
@@ -795,37 +949,27 @@ def load_yunxia_settings(
     }
     missing = [env_name for env_name in required.values() if not values.get(env_name)]
     if missing:
-        raise ValueError(
-            "incomplete Yunxia environment: " + ", ".join(sorted(missing))
-        )
+        raise ValueError("incomplete Yunxia environment: " + ", ".join(sorted(missing)))
     return YunxiaSettings(
         **{field: values[name] for field, name in required.items()},
         request_timeout_seconds=_positive_float(
             values, "AGENTGATE_INBANK_REQUEST_TIMEOUT_SECONDS", 180.0
         ),
-        health_wait_seconds=_positive_float(
-            values, "AGENTGATE_INBANK_HEALTH_WAIT_SECONDS", 300.0
-        ),
+        health_wait_seconds=_positive_float(values, "AGENTGATE_INBANK_HEALTH_WAIT_SECONDS", 300.0),
         health_poll_interval_seconds=_positive_float(
             values, "AGENTGATE_INBANK_HEALTH_POLL_INTERVAL_SECONDS", 5.0
         ),
-        debug_sse_failures=_environment_flag(
-            values, "AGENTGATE_INBANK_DEBUG_SSE_FAILURES"
-        ),
+        debug_sse_failures=_environment_flag(values, "AGENTGATE_INBANK_DEBUG_SSE_FAILURES"),
     )
 
 
 def _task_id_from_run_id(run_id: str) -> str:
     if len(run_id) < 8:
-        raise TargetExecutionError(
-            "invalid_request", "run_id must contain at least 8 characters"
-        )
+        raise TargetExecutionError("invalid_request", "run_id must contain at least 8 characters")
     return run_id[-8:]
 
 
-def _url(
-    base: str, path: str, query: Mapping[str, str] | None = None
-) -> str:
+def _url(base: str, path: str, query: Mapping[str, str] | None = None) -> str:
     value = base.rstrip("/") + "/" + path.lstrip("/")
     return value + ("?" + urlencode(query) if query else "")
 
@@ -867,12 +1011,13 @@ def _require_delete_success(response: Mapping[str, Any]) -> None:
 
     for field_name in ("resCode", "code"):
         if field_name in response and str(response[field_name]) not in _DELETE_SUCCESS_CODES:
-            raise TargetExecutionError("rejected", "delete Yunxia Pod was rejected")
+            detail = response.get("resMessage") or response.get("message") or (
+                f"{field_name}={response[field_name]}"
+            )
+            raise TargetExecutionError("rejected", str(detail))
 
 
-def _positive_float(
-    values: Mapping[str, str], name: str, default: float
-) -> float:
+def _positive_float(values: Mapping[str, str], name: str, default: float) -> float:
     raw = values.get(name)
     try:
         result = default if raw is None else float(raw)
