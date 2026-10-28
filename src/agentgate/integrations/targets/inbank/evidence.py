@@ -1,8 +1,7 @@
 """Bind in-bank turns and adapt observed facts to the existing Trace contract.
 
-Raw SDK attributes stay intact. Skill loading is projected as a routing selection,
-not a successful Skill execution or tool-ownership boundary. Adaptation diagnostics
-are provenance only; existing evaluators retain their missing-value semantics.
+Raw SDK attributes stay intact. Yunxia's reported intent is routing evidence, not
+proof of Skill execution. Tool calls and their arguments are adapted independently.
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
-from pathlib import PurePosixPath
 from typing import Any
 from uuid import uuid4
 
@@ -230,147 +228,47 @@ def _enrich_tool_arguments(trace: Trace) -> Trace:
     return trace.model_copy(update={"spans": tuple(spans)})
 
 
-def _skill_catalog(trace: Trace) -> dict[str, set[str]]:
-    catalog: dict[str, set[str]] = {}
-    for span in trace.spans:
-        value = span.attributes.get("trace_sdk.input")
-        if span.operation_type != "chain" or not isinstance(value, Mapping):
-            continue
-        entries = value.get("skills_metadata")
-        for item in entries if isinstance(entries, (list, tuple)) else ():
-            if (isinstance(item, Mapping) and isinstance(item.get("path"), str)
-                    and isinstance(item.get("name"), str) and item["name"].strip()):
-                catalog.setdefault(item["path"], set()).add(item["name"])
-    return catalog
-
-
-def _project_skill_selection(trace: Trace) -> tuple[TraceSpan, ...]:
-    catalog = _skill_catalog(trace)
-    requests = _tool_requests(trace)
-    groups: dict[str, list[tuple[TraceSpan, int, Mapping]]] = {}
-    for span, index, call in requests:
-        call_id = call.get("id")
-        key = call_id if isinstance(call_id, str) and call_id.strip() else f"{span.span_id}:{index}"
-        groups.setdefault(key, []).append((span, index, call))
-    executions: dict[str, list[TraceSpan]] = {}
-    for span in sorted(trace.spans, key=lambda item: item.sequence):
-        if span.operation_type == "tool" and (call_id := _tool_call_id(span)):
-            executions.setdefault(call_id, []).append(span)
-    candidates = []
-    diagnostics = []
-    # Repeated call IDs do not hide an agreeing Skill path or merge tool executions.
-    for key in dict.fromkeys((*groups, *executions)):
-        group = groups.get(key, ())
-        tools = executions.get(key, ())
-        if not (any(call.get("name") == "read_file" for _, _, call in group)
-                or any(tool.name == "read_file" for tool in tools)):
-            continue
-        if (any(call.get("name") != "read_file" for _, _, call in group)
-                or any(tool.name != "read_file" for tool in tools)):
-            diagnostics.append("ambiguous_skill_call")
-            continue
-        requested_paths = []
-        unparseable = False
-        for span, index, call in group:
-            try:
-                args = _argument_object(call.get("args"))
-            except (TypeError, ValueError):
-                unparseable = True
-                continue
-            if "file_path" in args:
-                requested_paths.append((span, index, key, args["file_path"],
-                                        f"trace_sdk.output.tool_calls.{index}.args.file_path"))
-        # Missing or malformed copies do not contradict an explicit path.
-        if len({canonical_json(item[3]) for item in requested_paths}) > 1:
-            diagnostics.append("conflicting_skill_arguments")
-            continue
-        executed_paths = []
-        for tool in tools:
-            try:
-                executed = _argument_object(tool.attributes.get("trace_sdk.input"))
-            except (TypeError, ValueError):
-                continue
-            if "file_path" in executed:
-                executed_paths.append((tool, 0, key, executed["file_path"], "trace_sdk.input.file_path"))
-        paths = [*requested_paths, *executed_paths]
-        if len({canonical_json(item[3]) for item in paths}) > 1:
-            diagnostics.append("ambiguous_skill_call")
-            continue
-        if paths:
-            candidates.append(paths[0])
-        elif unparseable:
-            diagnostics.append("unparseable_skill_arguments")
-    for span in trace.spans:
-        if span.operation_type != "tool" or span.name != "read_file":
-            continue
-        call_id = _tool_call_id(span)
-        if call_id is not None:
-            continue
-        args = span.attributes.get("arguments")
-        if not isinstance(args, Mapping):
-            continue
-        # Without a call ID, a request/result pair cannot safely be counted twice.
-        if any(path == args.get("file_path") for _, _, _, path, _ in candidates):
-            continue
-        candidates.append((span, 0, span.span_id, args.get("file_path"),
-                           "trace_sdk.input.file_path"))
-    root = next(s for s in trace.spans if s.operation_type == "turn")
-    projected: dict[str, list[TraceSpan]] = {}
-    for span, index, key, path, field in candidates:
-        if not isinstance(path, str) or not path.endswith("/SKILL.md"):
-            continue
-        parts = PurePosixPath(path).parts
-        if ".." in parts or not path.startswith("/") or "__PHOTO_UNRECOVERED_" in path:
-            diagnostics.append("invalid_skill_path")
-            continue
-        names = catalog.get(path)
-        if names is None:
-            match = re.fullmatch(r"/mnt/oneagent-skills/[^/]+/skills/([^/]+)/SKILL\.md", path)
-            names = {match[1]} if match else set()
-        if len(names) != 1:
-            diagnostics.append("unresolved_skill_name")
-            continue
-        sid = hashlib.sha256(
-            f"skill-selection:{trace.trace_id}:{trace.case_id}:{root.span_id}:{key}".encode()
-        ).hexdigest()[:16]
-        derived = TraceSpan(
-            trace_id=trace.trace_id, span_id=sid, parent_span_id=root.span_id,
-            name="inbank.skill_selection", operation_type="routing", sequence=0,
-            started_at=span.started_at, ended_at=span.started_at, status="unset",
-            attributes={
-                "selected_skill": next(iter(names)),
-                "agentgate.turn.id": root.attributes["agentgate.turn.id"],
-                "inbank.skill_selection": {
-                    "derived": True, "basis": "skill_load_request",
-                    "source_span_id": span.span_id, "source_path": field,
-                    "tool_call_id": key, "file_path": path,
-                    "timing": "source_start_reference",
-                },
+def project_yunxia_intent_selection(
+    turn_spans: tuple[TraceSpan, ...], message: Mapping[str, Any],
+) -> tuple[TraceSpan, ...]:
+    """Use this turn's reported intent as routing evidence, independently of tools."""
+    retained = tuple(
+        span for span in turn_spans
+        if not (span.operation_type == "routing" and span.name == "inbank.yunxia.skill_selection")
+    )
+    intent_code = message.get("intent_code")
+    if not isinstance(intent_code, str) or not intent_code.strip():
+        return retained
+    root = next((span for span in retained if span.operation_type == "turn"), None)
+    if root is None:
+        return retained
+    sid = hashlib.sha256(
+        f"yunxia-intent-selection:{root.trace_id}:{root.span_id}".encode()
+    ).hexdigest()[:16]
+    route = TraceSpan(
+        trace_id=root.trace_id, span_id=sid, parent_span_id=root.span_id,
+        name="inbank.yunxia.skill_selection", operation_type="routing", sequence=0,
+        started_at=root.ended_at, ended_at=root.ended_at, status="unset",
+        attributes={
+            "selected_skill": intent_code.strip(),
+            "agentgate.turn.id": root.attributes["agentgate.turn.id"],
+            "inbank.skill_selection": {
+                "derived": True, "basis": "message_intent_code",
+                "source_span_id": root.span_id, "source_path": "message.intent_code",
+                "timing": "turn_end_reference",
             },
-        )
-        projected.setdefault(span.span_id, []).append(derived)
-    spans = []
-    for span in sorted(trace.spans, key=lambda item: item.sequence):
-        if span.span_id == root.span_id and diagnostics:
-            span = span.model_copy(update={"attributes": FrozenJsonObject({
-                **span.attributes.to_dict(),
-                "inbank.skill_selection_diagnostics": sorted(set(diagnostics)),
-            })})
-        for item in (*projected.get(span.span_id, ()), span):
-            spans.append(item.model_copy(update={"sequence": len(spans)}))
-    if diagnostics:
-        LOGGER.warning("inbank_trace_skill_unmapped case_id=%r turn_id=%r reasons=%s",
-                       trace.case_id, root.attributes["agentgate.turn.id"],
-                       ",".join(sorted(set(diagnostics))))
-    return tuple(spans)
+        },
+    )
+    spans = list(retained)
+    spans.insert(spans.index(root) + 1, route)
+    return tuple(span.model_copy(update={"sequence": index}) for index, span in enumerate(spans))
 
 
 def _adapt_turn_spans(trace: Trace) -> tuple[TraceSpan, ...]:
-    spans = _project_skill_selection(_enrich_tool_arguments(trace))
+    spans = _enrich_tool_arguments(trace).spans
     LOGGER.info(
-        "inbank_trace_adapted case_id=%r tools=%d skill_selections=%d unmapped_arguments=%d",
+        "inbank_trace_adapted case_id=%r tools=%d unmapped_arguments=%d",
         trace.case_id, sum(s.operation_type == "tool" for s in spans),
-        sum(s.operation_type == "routing" for s in spans),
         sum(s.operation_type == "tool" and "arguments" not in s.attributes for s in spans),
     )
     return spans

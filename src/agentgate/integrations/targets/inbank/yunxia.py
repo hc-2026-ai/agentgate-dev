@@ -34,6 +34,7 @@ from agentgate.integrations.targets.inbank.diagnostics import (
 from agentgate.integrations.targets.inbank.evidence import (
     normalize_turn_evidence,
     output_only_turn_span,
+    project_yunxia_intent_selection,
 )
 from agentgate.run.target_protocol import (
     CaseExecutionPending,
@@ -746,6 +747,7 @@ class InbankYunxiaTargetAdapter:
                         request, turn, adapter="yunxia", project_id=project_id,
                         request_id=request_id, started_at=started_at, ended_at=ended_at, error=exc,
                     ),)
+                turn_spans = project_yunxia_intent_selection(turn_spans, final_output)
                 for span in turn_spans:
                     spans.append(span.model_copy(update={"sequence": len(spans)}))
                 LOGGER.info(

@@ -467,7 +467,8 @@ function close() {
           ><button
             v-if="method === 'manual'"
             class="primary"
-            :disabled="busy"
+            :disabled="busy || manualEditor?.fetchingVariables"
+            :title="manualEditor?.fetchingVariables ? '正在获取初始化变量，请稍候' : ''"
             @click="manualEditor?.save()"
           >
             {{ busy ? '保存中…' : '保存样本' }}</button

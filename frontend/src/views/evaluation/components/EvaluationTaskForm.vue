@@ -28,6 +28,7 @@ const props = defineProps<{
   };
 }>();
 const emit = defineEmits<{ close: []; created: [link: TaskLink] }>();
+const PLATFORM_DEFAULT_TIMEOUT_SECONDS = 15 * 60;
 const taskName = ref('');
 const taskKind = ref<'single' | 'ab'>('single'),
   candidateVersion = ref(''),
@@ -39,7 +40,7 @@ const localBankSelected = computed(
 );
 const auth = useAuthStore();
 const inbankPlatformSelected = computed(() =>
-  auth.loginMode === 'bank' && !!platformSelection.value && !platformSelection.value.localTarget,
+  auth.usesPlatformDirectory && !!platformSelection.value && !platformSelection.value.localTarget,
 );
 watch(inbankPlatformSelected, (selected) => {
   if (taskKind.value === 'ab' && !selected) concurrency.value = 1;
@@ -50,7 +51,11 @@ const platformDirectory = computed(() =>
 const platformToken = computed(() => (auth.usesPlatformDirectory ? auth.token : 'local'));
 const platformTeamId = computed(() => (auth.usesPlatformDirectory ? auth.teamId : ''));
 function receivePlatformSelection(selection: AgentTargetSelection | null) {
+  const wasLegacyAb = taskKind.value === 'ab' && !platformSelection.value;
   platformSelection.value = selection;
+  if (wasLegacyAb && selection && !selection.localTarget && timeout.value === 300)
+    timeout.value = PLATFORM_DEFAULT_TIMEOUT_SECONDS;
+  if (selection?.localTarget?.adapter_type === 'demo_loan') timeout.value = 300;
   if (selection?.localTarget?.adapter_type === 'local_bank') {
     concurrency.value = 1;
     timeout.value = 180;
@@ -283,7 +288,7 @@ watch(repetitions, (v) => {
 const datasetVersions = ref<{ version: number; cases: any[] }[]>([]),
   selectedDatasetVersion = ref<number | null>(null);
 const concurrency = ref(1),
-  timeout = ref(300),
+  timeout = ref(PLATFORM_DEFAULT_TIMEOUT_SECONDS),
   retries = ref(0),
   formError = ref('');
 const runSource = ref<{
@@ -311,7 +316,7 @@ async function openCreate(source?: {
   selectedCaseIds.value = source?.caseIds ?? [];
   repetitions.value = 1;
   concurrency.value = 1;
-  timeout.value = 300;
+  timeout.value = PLATFORM_DEFAULT_TIMEOUT_SECONDS;
   retries.value = 0;
   launchMode.value = 'now';
   scheduledAt.value = '';
@@ -585,7 +590,7 @@ async function submit() {
     const bankArrangeType =
       platform &&
       !localTarget &&
-      auth.loginMode === 'bank' &&
+      auth.usesPlatformDirectory &&
       platform.target.typeGroup === 'base/workflow'
         ? (platform.target.platformArrangeType ?? platform.target.platformAgentType)
         : null;
@@ -641,7 +646,7 @@ async function submit() {
     } else if (
       platform &&
       !localTarget &&
-      auth.loginMode === 'bank' &&
+      auth.usesPlatformDirectory &&
       platform.target.typeGroup === 'abcclaw'
     ) {
       const object = (value: unknown): value is Record<string, unknown> =>
@@ -936,7 +941,7 @@ watch(taskKind, (kind) => {
     scope.value = 'all';
     launchMode.value = 'now';
     if (!inbankPlatformSelected.value) concurrency.value = 1;
-    timeout.value = 300;
+    if (!platformSelection.value || platformSelection.value.localTarget) timeout.value = 300;
     retries.value = 0;
   }
 });
@@ -1237,7 +1242,7 @@ onMounted(() => void openCreate(props.source));
         <label class="field"
           >执行超时（秒）<input
             class="input"
-            :disabled="taskKind === 'ab'"
+            :disabled="taskKind === 'ab' && (!platformSelection || !!platformSelection.localTarget)"
             v-model.number="timeout"
             :title="
               bankTarget || localBankSelected ? '1–300 秒，最大 300 秒' : '1–3600 秒，最大 3600 秒'

@@ -256,7 +256,16 @@ class AgentChatClient:
             self.base_url, f"/agent-api/{quote(self.agent_name, safe='')}/chatabc/init_session"
         )
         data = (
-            {"config_variables": (prompt_variables or []) + (tool_variables or [])}
+            {
+                "config_variables": [
+                    {key: variable[key] for key in ("name", "value", "type") if key in variable}
+                    for variable in (prompt_variables or []) + (tool_variables or [])
+                    if variable.get("value") is not None
+                    and (
+                        not isinstance(variable["value"], str) or variable["value"].strip()
+                    )
+                ]
+            }
             if self.arrange_type == "workflow"
             else {
                 "prompt_variables": prompt_variables or [],

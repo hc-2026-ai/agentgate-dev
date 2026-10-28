@@ -287,10 +287,10 @@ def _require_case_evaluator(
 
 
 def _output_only_check(spec: EvaluatorSpec, trace: Trace, turn_id: str | None = None) -> CheckDraft | None:
-    """Missing trajectory is unknown evidence, not proof of absent tool/skill use."""
+    """Skip only evaluators that require the missing execution trajectory."""
     if spec.kind in (EvaluatorKind.HYBRID, EvaluatorKind.LLM_GROUP):
         return None  # Compose the actual child results, including skipped checks.
-    if spec.kind == EvaluatorKind.RULE and spec.implementation_id == "final_output":
+    if spec.kind == EvaluatorKind.RULE and spec.implementation_id in {"final_output", "skill_routing"}:
         return None
     if spec.kind == EvaluatorKind.LLM_JUDGE and spec.config.get("input_selection", "final_output") == "final_output":
         return None
@@ -305,7 +305,7 @@ def _output_only_check(spec: EvaluatorSpec, trace: Trace, turn_id: str | None = 
     )
     return CheckDraft(
         name=spec.name, turn_id=turn_id, outcome=Outcome.NOT_APPLICABLE,
-        reason="Trace 证据不足（output_only），跳过依赖轨迹的检查；不能判定工具或 Skill 是否调用",
+        reason="Trace 证据不足（output_only），跳过依赖轨迹的检查；不能判定内部执行情况",
         actual_missing=True,
     )
 

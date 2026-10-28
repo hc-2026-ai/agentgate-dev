@@ -2,6 +2,20 @@
 
 本次补齐行内 Trace 查询和 BJS 失败处理。Skill 静态分析按用户要求暂缓：真实行内版本定义接口尚未提供，不使用本地 `/web/agent/capabilities` 扩展冒充。
 
+## 云虾 Skill 路由取值 — 2026-10-26
+
+云虾每轮最终 `message` 响应中的 `intent_code` 直接作为该轮路由评估值，
+写入标准 Trace 的 `routing.selected_skill`。样本的 Skill 路由期望值应填写对应的
+`intent_code`。该记录表示智能体报告的意图，不证明 Skill 内部执行成功。
+
+- 移除 `read_file`、`SKILL.md` 路径及 Skill 目录元数据推断，以及相应的路径、名称和歧义校验。
+- 各轮只使用本轮响应；缺失、空白或非字符串的值不生成路由，不复用上一轮，也不从文件路径兜底。
+  此类缺失不会抛出新的执行异常；本轮配置了 Skill 路由期望时，按“未产生路由决策”判失败。
+- Skill 路由评估不依赖 Trace 查询是否成功：有 `intent_code` 就比较，无有效值就按缺失处理。
+  工具、参数等依赖过程记录的评估仍区分 `trace_server` 与 `output_only`。
+- 基础编排与工作流不生成 Skill 路由。`read_file` 仍是普通工具调用，保留其原始输入、输出及参数。
+- 行外模式和通用路由评估器的比较规则保持原有协议。
+
 ## Yunxia per-turn request fields — 2026-10-17
 
 云虾没有 `init_session`。请求字段统一填写在每轮 `input`，不使用 Case 的

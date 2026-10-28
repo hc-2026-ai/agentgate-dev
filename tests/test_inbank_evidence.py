@@ -12,6 +12,7 @@ from agentgate.domain import (
     CaseTurn,
     Equals,
     ExecutionPathExpectation,
+    FrozenJsonObject,
     SkillRouteExpectation,
     ToolArgumentExpectation,
     ToolCallExpectation,
@@ -27,6 +28,8 @@ from agentgate.integrations.targets.inbank.evidence import (
     configured_trace_source,
     fetch_turn_evidence,
     normalize_turn_evidence,
+    output_only_turn_span,
+    project_yunxia_intent_selection,
 )
 from agentgate.run.target_protocol import CaseExecutionRequest, TargetExecutionError
 
@@ -289,6 +292,12 @@ def adapt_detail(detail, request=None, turn=None):
     )
 
 
+def reported_intent(trace, intent="hello"):
+    return trace.model_copy(update={"spans": project_yunxia_intent_selection(
+        trace.spans, {"intent_code": intent},
+    )})
+
+
 @pytest.mark.parametrize("tool_status", ["success", "error"])
 def test_turn_execution_state_comes_from_trace_root_not_output_or_tool(tool_status):
     detail = skill_detail()
@@ -354,15 +363,14 @@ def test_existing_final_state_rule_can_consume_projected_execution_status(expect
     assert check.outcome == outcome
 
 
-def test_customer_semantics_preserve_raw_tree_and_project_selection_once():
+def test_customer_semantics_preserve_raw_tree_without_inferring_skill():
     detail = skill_detail()
     original = deepcopy(detail)
     trace = adapt_detail(detail)
     assert detail == original
     assert trace == adapt_detail(detail)
-    assert len(trace.spans) == len(detail["spans"]) + 2  # Turn wrapper + selection.
+    assert len(trace.spans) == len(detail["spans"]) + 1  # Turn wrapper only.
     tool = next(s for s in trace.spans if s.operation_type == "tool")
-    route = next(s for s in trace.spans if s.operation_type == "routing")
     chain = next(s for s in trace.spans if s.operation_type == "chain")
     assert tool.name == "read_file"
     assert tool.parent_span_id == chain.span_id
@@ -370,15 +378,10 @@ def test_customer_semantics_preserve_raw_tree_and_project_selection_once():
     assert tool.attributes["trace_sdk.output"] == detail["spans"][2]["output"]
     assert tool.attributes["arguments"] == detail["spans"][1]["output"]["tool_calls"][0]["args"]
     assert chain.attributes["trace_sdk.input"]["skills_metadata"][0]["name"] == "hello"
-    assert route.attributes["selected_skill"] == "hello"
-    assert route.status == "unset"
-    provenance = route.attributes["inbank.skill_selection"]
-    assert provenance["derived"] is True
-    assert provenance["basis"] == "skill_load_request"
-    assert provenance["source_span_id"] in {s.span_id for s in trace.spans}
     assert not any(s.operation_type in {"skill", "workflow", "state"} for s in trace.spans)
     assert not any("agentgate.evidence" in s.attributes for s in trace.spans)
     assert trace.final_state == {"execution_status": "success"}
+    assert not any(s.operation_type == "routing" for s in trace.spans)
 
 
 @pytest.mark.parametrize("raw", [
@@ -438,7 +441,7 @@ def test_matching_call_id_fills_missing_fields_without_overwriting_execution():
     assert tool.attributes["arguments"]["limit"] == 2000
     assert tool.attributes["arguments"]["file_path"].endswith("/hello/SKILL.md")
     assert tool.attributes["inbank.argument_diagnostic"] == "conflicting_arguments"
-    assert sum(s.operation_type == "routing" for s in trace.spans) == 1
+    assert sum(s.operation_type == "routing" for s in trace.spans) == 0
 
 
 def test_argument_conflicts_are_type_sensitive():
@@ -476,10 +479,7 @@ def test_execution_arguments_may_include_parameters_omitted_by_request(encoding,
     assert [item["path"] for item in tool.attributes["inbank.argument_sources"]] == [
         "trace_sdk.input", "trace_sdk.output.tool_calls.0.args",
     ]
-    routes = [s for s in trace.spans if s.operation_type == "routing"]
-    assert len(routes) == 1
-    assert routes[0].attributes["selected_skill"] == "hello-ces-skills"
-    assert routes[0].attributes["inbank.skill_selection"]["tool_call_id"] == call["id"]
+    assert not any(s.operation_type == "routing" for s in trace.spans)
     assert "inbank.skill_selection_diagnostics" not in trace.spans[0].attributes
     assert sum(s.operation_type == "tool" for s in trace.spans) == 1
 
@@ -508,14 +508,14 @@ def test_observed_execution_superset_is_not_specific_to_read_file(requested, exe
     ({"options": {"enabled": True}}, {"options": {"enabled": 1}}),
     ({"items": [True]}, {"items": [1]}),
 ])
-def test_non_path_argument_conflicts_do_not_hide_unambiguous_skill(requested, executed):
+def test_argument_conflicts_do_not_change_reported_intent(requested, executed):
     detail = skill_detail()
     call = detail["spans"][1]["output"]["tool_calls"][0]
     path = call["args"]["file_path"]
     call["args"] = {"file_path": path, **requested}
     detail["spans"][2]["input"] = repr({"file_path": path, **executed})
 
-    trace = adapt_detail(detail)
+    trace = reported_intent(adapt_detail(detail))
 
     tool = next(s for s in trace.spans if s.operation_type == "tool")
     assert tool.attributes["inbank.argument_diagnostic"] == "conflicting_arguments"
@@ -538,11 +538,11 @@ def test_request_omission_does_not_conflict_with_explicit_value(raw):
     tool = next(s for s in trace.spans if s.operation_type == "tool")
     assert tool.attributes["arguments"] == calls[0]["args"]
     assert "inbank.argument_diagnostic" not in tool.attributes
-    assert sum(s.operation_type == "routing" for s in trace.spans) == 1
+    assert sum(s.operation_type == "routing" for s in trace.spans) == 0
 
 
 @pytest.mark.parametrize("with_tool", [True, False])
-def test_repeated_request_non_path_differences_preserve_one_skill(with_tool):
+def test_repeated_tool_requests_do_not_duplicate_reported_intent(with_tool):
     detail = skill_detail()
     calls = detail["spans"][1]["output"]["tool_calls"]
     duplicate = deepcopy(calls[0])
@@ -551,7 +551,7 @@ def test_repeated_request_non_path_differences_preserve_one_skill(with_tool):
     if not with_tool:
         detail["spans"].pop()
         detail["trace"]["spanCount"] -= 1
-    trace = adapt_detail(detail)
+    trace = reported_intent(adapt_detail(detail))
     routes = [s for s in trace.spans if s.operation_type == "routing"]
     assert len(routes) == 1
     assert routes[0].attributes["selected_skill"] == "hello"
@@ -562,14 +562,14 @@ def test_repeated_request_non_path_differences_preserve_one_skill(with_tool):
 
 
 @pytest.mark.parametrize("path", ["/mnt/oneagent-skills/bundle/skills/other/SKILL.md", None])
-def test_execution_path_disagreement_still_blocks_skill(path):
+def test_disagreeing_file_paths_do_not_create_skill_diagnostics(path):
     detail = skill_detail()
     args = dict(detail["spans"][1]["output"]["tool_calls"][0]["args"])
     args["file_path"] = path
     detail["spans"][2]["input"] = repr(args)
     trace = adapt_detail(detail)
     assert not any(s.operation_type == "routing" for s in trace.spans)
-    assert trace.spans[0].attributes["inbank.skill_selection_diagnostics"] == ("ambiguous_skill_call",)
+    assert "inbank.skill_selection_diagnostics" not in trace.spans[0].attributes
 
 
 @pytest.mark.parametrize("expected,outcome", [(500, "pass"), (1000, "fail")])
@@ -583,7 +583,7 @@ def test_existing_rules_check_observed_extra_parameter_without_false_pass(expect
     call = detail["spans"][1]["output"]["tool_calls"][0]
     call["args"].pop("limit")
     detail["spans"][2]["input"] = repr({**call["args"], "limit": 500})
-    trace = adapt_detail(detail)
+    trace = reported_intent(adapt_detail(detail))
     turn = CaseTurn(id="first", input={"txt": "hello"}, expectations=(
         SkillRouteExpectation(condition=Equals(expected="hello")),
         ToolArgumentExpectation(tool="read_file", path="arguments.limit", condition=Equals(expected=expected)),
@@ -609,7 +609,7 @@ def test_argument_difference_uses_execution_value_independently_of_expectation(e
     detail = skill_detail()
     call = detail["spans"][1]["output"]["tool_calls"][0]
     detail["spans"][2]["input"] = repr({**call["args"], "limit": 500})
-    trace = adapt_detail(detail)
+    trace = reported_intent(adapt_detail(detail))
     turn = CaseTurn(id="first", input={"txt": "hello"}, expectations=(
         SkillRouteExpectation(condition=Equals(expected="hello")),
         ToolArgumentExpectation(tool="read_file", path="arguments.file_path",
@@ -642,7 +642,7 @@ def test_only_missing_execution_fields_are_filled_from_linked_request(executed):
     assert tool.attributes["trace_sdk.input"] == original["spans"][2]["input"]
     assert detail == original
     assert len(tool.attributes["inbank.argument_sources"]) == 2
-    assert sum(s.operation_type == "routing" for s in trace.spans) == 1
+    assert sum(s.operation_type == "routing" for s in trace.spans) == 0
     assert ("inbank.argument_diagnostic" in tool.attributes) == ("limit" in executed)
 
 
@@ -663,7 +663,7 @@ def test_unresolved_request_field_does_not_hide_other_fields(raw, reverse_reques
     if reverse_requests:
         calls.reverse()
     detail["spans"][2]["input"] = raw
-    trace = adapt_detail(detail)
+    trace = reported_intent(adapt_detail(detail))
     tool = next(s for s in trace.spans if s.operation_type == "tool")
     assert tool.attributes["arguments"]["file_path"] == path
     assert "limit" not in tool.attributes["arguments"]
@@ -789,10 +789,9 @@ def test_ambiguous_association_with_unparseable_input_never_borrows_request_argu
 
 @pytest.mark.parametrize("same_path", [True, False])
 @pytest.mark.parametrize("with_request", [True, False])
-def test_duplicate_call_ids_keep_inputs_and_project_one_unambiguous_skill(same_path, with_request):
+def test_duplicate_call_ids_keep_each_observed_tools_input(same_path, with_request):
     from test_rule_tool_use import evaluator_spec, resolve_unexpected
 
-    from agentgate.evaluator.rule.routing import SkillRoutingEvaluator
     from agentgate.evaluator.rule.tool_use import (
         ForbiddenToolEvaluator,
         RequiredToolEvaluator,
@@ -818,25 +817,7 @@ def test_duplicate_call_ids_keep_inputs_and_project_one_unambiguous_skill(same_p
     assert tools[0].attributes["arguments"]["limit"] == 1000
     assert tools[1].attributes["arguments"] == duplicate_args
     routes = [s for s in trace.spans if s.operation_type == "routing"]
-    assert len(routes) == int(same_path)
-    if same_path:
-        assert routes[0].attributes["selected_skill"] == "hello"
-        selection = routes[0].attributes["inbank.skill_selection"]
-        expected_source = next(s for s in trace.spans if s.operation_type == "llm") if with_request else tools[0]
-        assert selection["source_span_id"] == expected_source.span_id
-        assert selection["source_path"] == (
-            "trace_sdk.output.tool_calls.0.args.file_path" if with_request else "trace_sdk.input.file_path"
-        )
-        assert "inbank.skill_selection_diagnostics" not in trace.spans[0].attributes
-        turn = CaseTurn(id="first", input={"txt": "hello"}, expectations=(
-            SkillRouteExpectation(condition=Equals(expected="hello")),
-        ))
-        check = SkillRoutingEvaluator().evaluate(
-            evaluator_spec("skill_routing"), turn, trace, resolve_unexpected,
-        ).checks[0]
-        assert check.outcome == "pass" and check.actual == "hello"
-    else:
-        assert "ambiguous_skill_call" in trace.spans[0].attributes["inbank.skill_selection_diagnostics"]
+    assert routes == []
     turn = CaseTurn(id="first", input={"txt": "hello"}, expectations=(
         ToolCallExpectation(tool="read_file"),
         ToolCallExpectation(tool="read_file", mode="forbidden"),
@@ -865,7 +846,7 @@ def test_duplicate_call_ids_keep_inputs_and_project_one_unambiguous_skill(same_p
 
 @pytest.mark.parametrize("raw", [None, "invalid arguments", {}, {"limit": 500}])
 @pytest.mark.parametrize("with_request", [True, False])
-def test_incomplete_duplicate_tool_does_not_hide_a_known_skill_path(raw, with_request):
+def test_incomplete_duplicate_tools_preserve_observed_tool_count(raw, with_request):
     detail = skill_detail()
     if not with_request:
         detail["spans"][1]["output"]["tool_calls"] = []
@@ -875,14 +856,14 @@ def test_incomplete_duplicate_tool_does_not_hide_a_known_skill_path(raw, with_re
     detail["trace"]["spanCount"] += 1
     trace = adapt_detail(detail)
     routes = [s for s in trace.spans if s.operation_type == "routing"]
-    assert len(routes) == 1 and routes[0].attributes["selected_skill"] == "hello"
+    assert routes == []
     assert "inbank.skill_selection_diagnostics" not in trace.spans[0].attributes
     assert sum(s.operation_type == "tool" for s in trace.spans) == 2
 
 
 @pytest.mark.parametrize("conflict", ["tool_name", "null_path"])
 @pytest.mark.parametrize("with_request", [True, False])
-def test_duplicate_tool_identity_conflicts_still_block_only_skill(conflict, with_request):
+def test_duplicate_tool_identity_differences_do_not_generate_skill_diagnostics(conflict, with_request):
     detail = skill_detail()
     if not with_request:
         detail["spans"][1]["output"]["tool_calls"] = []
@@ -896,20 +877,20 @@ def test_duplicate_tool_identity_conflicts_still_block_only_skill(conflict, with
     detail["trace"]["spanCount"] += 1
     trace = adapt_detail(detail)
     assert not any(s.operation_type == "routing" for s in trace.spans)
-    assert "ambiguous_skill_call" in trace.spans[0].attributes["inbank.skill_selection_diagnostics"]
+    assert "inbank.skill_selection_diagnostics" not in trace.spans[0].attributes
     tools = [s for s in trace.spans if s.operation_type == "tool"]
     assert len(tools) == 2 and all("arguments" in s.attributes for s in tools)
 
 
 @pytest.mark.parametrize("with_request", [True, False])
-def test_distinct_call_ids_for_same_skill_are_not_deduplicated(with_request):
+def test_distinct_tool_calls_are_not_deduplicated(with_request):
     detail = skill_detail(skills=("hello", "hello"))
     if not with_request:
         detail["spans"][1]["output"]["tool_calls"] = []
     trace = adapt_detail(detail)
     routes = [s for s in trace.spans if s.operation_type == "routing"]
-    assert [s.attributes["selected_skill"] for s in routes] == ["hello", "hello"]
-    assert [s.attributes["inbank.skill_selection"]["tool_call_id"] for s in routes] == ["call-0", "call-1"]
+    assert routes == []
+    assert [s.attributes["tool_call_id"] for s in trace.spans if s.operation_type == "tool"] == ["call-0", "call-1"]
     assert len({s.span_id for s in trace.spans}) == len(trace.spans)
 
 
@@ -935,22 +916,21 @@ def test_repeated_call_ids_are_resolved_within_each_turn_only(assembly):
         trace = assemble_evidence(request, "inbank-tests", evidence, outcomes)
         assert len({s.span_id for s in trace.spans}) == len(trace.spans)
         turns = [trace.for_turn(turn.id) for turn in request.case.turns]
-    selections = []
+    tool_ids = []
     for trace, turn, skill in zip(turns, request.case.turns, ("hello", "other")):
-        routes = [s for s in trace.spans if s.operation_type == "routing"]
-        assert len(routes) == 1
-        selections.append(routes[0])
-        assert routes[0].attributes["selected_skill"] == skill
-        assert routes[0].attributes["agentgate.turn.id"] == turn.id
-        assert routes[0].attributes["inbank.skill_selection"]["tool_call_id"] == "call-0"
-        assert sum(s.operation_type == "tool" for s in trace.spans) == 2
+        assert not any(s.operation_type == "routing" for s in trace.spans)
+        tools = [s for s in trace.spans if s.operation_type == "tool"]
+        assert len(tools) == 2
+        assert trace.spans[0].attributes["agentgate.turn.id"] == turn.id
+        assert all(s.attributes["arguments"]["file_path"].endswith(f"/{skill}/SKILL.md") for s in tools)
+        tool_ids.extend(s.span_id for s in tools)
         assert "inbank.skill_selection_diagnostics" not in trace.spans[0].attributes
-    assert selections[0].span_id != selections[1].span_id
+    assert len(tool_ids) == len(set(tool_ids))
 
 
 @pytest.mark.parametrize("request_args", [None, "invalid request arguments", {}, {"limit": 1000}])
 @pytest.mark.parametrize("encoding", ["object", "json", "literal"])
-def test_skill_can_use_execution_path_when_request_arguments_are_incomplete(request_args, encoding):
+def test_execution_arguments_survive_incomplete_requests(request_args, encoding):
     detail = skill_detail()
     call = detail["spans"][1]["output"]["tool_calls"][0]
     executed = dict(call["args"])
@@ -962,15 +942,7 @@ def test_skill_can_use_execution_path_when_request_arguments_are_incomplete(requ
     trace = adapt_detail(detail)
 
     tool = next(s for s in trace.spans if s.operation_type == "tool")
-    routes = [s for s in trace.spans if s.operation_type == "routing"]
-    assert len(routes) == 1
-    route = routes[0]
-    assert route.attributes["selected_skill"] == "hello"
-    selection = route.attributes["inbank.skill_selection"]
-    assert selection["source_span_id"] == tool.span_id
-    assert selection["source_path"] == "trace_sdk.input.file_path"
-    assert selection["tool_call_id"] == call["id"]
-    assert route.started_at == tool.started_at and route.status == "unset"
+    assert not any(s.operation_type == "routing" for s in trace.spans)
     assert tool.attributes["arguments"] == executed
     assert "inbank.skill_selection_diagnostics" not in trace.spans[0].attributes
     assert detail == original
@@ -980,7 +952,7 @@ def test_skill_can_use_execution_path_when_request_arguments_are_incomplete(requ
 @pytest.mark.parametrize("request_args", [None, "invalid request arguments", {}, {"limit": 2000}])
 @pytest.mark.parametrize("incomplete_first", [True, False])
 @pytest.mark.parametrize("with_tool", [True, False])
-def test_incomplete_request_copy_does_not_hide_an_explicit_skill_path(request_args, incomplete_first, with_tool):
+def test_incomplete_request_copies_do_not_infer_skill_from_file_path(request_args, incomplete_first, with_tool):
     detail = skill_detail()
     calls = detail["spans"][1]["output"]["tool_calls"]
     calls.append({**deepcopy(calls[0]), "args": request_args})
@@ -990,15 +962,7 @@ def test_incomplete_request_copy_does_not_hide_an_explicit_skill_path(request_ar
         detail["spans"].pop()
         detail["trace"]["spanCount"] -= 1
     trace = adapt_detail(detail)
-    routes = [s for s in trace.spans if s.operation_type == "routing"]
-    assert len(routes) == 1
-    route = routes[0]
-    llm = next(s for s in trace.spans if s.operation_type == "llm")
-    assert route.attributes["selected_skill"] == "hello"
-    assert route.attributes["inbank.skill_selection"]["source_span_id"] == llm.span_id
-    assert route.attributes["inbank.skill_selection"]["source_path"] == (
-        f"trace_sdk.output.tool_calls.{1 if incomplete_first else 0}.args.file_path"
-    )
+    assert not any(s.operation_type == "routing" for s in trace.spans)
     assert "inbank.skill_selection_diagnostics" not in trace.spans[0].attributes
     assert sum(s.operation_type == "tool" for s in trace.spans) == int(with_tool)
 
@@ -1013,7 +977,7 @@ def test_incomplete_request_without_execution_path_does_not_invent_skill_or_tool
     assert not any(s.operation_type in {"tool", "routing"} for s in trace.spans)
 
 
-def test_skill_execution_fallback_uses_observed_path_not_catalog_or_expected_skill():
+def test_missing_intent_does_not_use_observed_skill_path():
     from test_rule_tool_use import evaluator_spec, resolve_unexpected
 
     from agentgate.evaluator.rule.routing import SkillRoutingEvaluator
@@ -1028,8 +992,8 @@ def test_skill_execution_fallback_uses_observed_path_not_catalog_or_expected_ski
     check = SkillRoutingEvaluator().evaluate(
         evaluator_spec("skill_routing"), turn, trace, resolve_unexpected,
     ).checks[0]
-    assert check.outcome == "fail" and check.actual == "other"
-    assert not check.actual_missing
+    assert check.outcome == "fail" and check.actual is None
+    assert check.actual_missing
 
 
 @pytest.mark.parametrize("path", [None, "", 123, "/mnt/oneagent-skills/bundle/skills/other/SKILL.md"])
@@ -1045,7 +1009,7 @@ def test_explicit_request_path_contradiction_is_not_treated_as_missing(path, wit
         detail["trace"]["spanCount"] -= 1
     trace = adapt_detail(detail)
     assert not any(s.operation_type == "routing" for s in trace.spans)
-    assert "conflicting_skill_arguments" in trace.spans[0].attributes["inbank.skill_selection_diagnostics"]
+    assert "inbank.skill_selection_diagnostics" not in trace.spans[0].attributes
 
 
 @pytest.mark.parametrize("problem", ["argument_difference", "other_name", "duplicate_tools", "bad_request"])
@@ -1108,7 +1072,7 @@ def test_available_skills_and_historical_messages_are_not_selections(mode):
 
 
 @pytest.mark.parametrize("mode", ["request_only", "tool_only", "tool_error", "no_call_id"])
-def test_selection_does_not_claim_successful_skill_execution(mode):
+def test_reported_intent_does_not_claim_skill_execution(mode):
     detail = skill_detail()
     if mode == "request_only":
         detail["spans"] = detail["spans"][:2]
@@ -1119,7 +1083,7 @@ def test_selection_does_not_claim_successful_skill_execution(mode):
         detail["spans"][2]["status"] = "error"
     else:
         detail["spans"][2]["output"].pop("tool_call_id")
-    trace = adapt_detail(detail)
+    trace = reported_intent(adapt_detail(detail))
     routes = [s for s in trace.spans if s.operation_type == "routing"]
     assert len(routes) == 1
     assert routes[0].attributes["selected_skill"] == "hello"
@@ -1128,21 +1092,11 @@ def test_selection_does_not_claim_successful_skill_execution(mode):
     assert not any(s.operation_type == "skill" for s in trace.spans)
 
 
-def test_catalog_matches_exact_path_and_known_layout_is_fallback():
-    detail = skill_detail()
-    detail["spans"][0]["input"]["skills_metadata"][0]["name"] = "canonical-hello"
-    route = next(s for s in adapt_detail(detail).spans if s.operation_type == "routing")
-    assert route.attributes["selected_skill"] == "canonical-hello"
-    detail["spans"][0]["input"]["skills_metadata"] = []
-    route = next(s for s in adapt_detail(detail).spans if s.operation_type == "routing")
-    assert route.attributes["selected_skill"] == "hello"
-    detail["spans"][1]["output"]["tool_calls"][0]["args"]["file_path"] = "/arbitrary/hello/SKILL.md"
-    detail["spans"][2]["input"] = repr(detail["spans"][1]["output"]["tool_calls"][0]["args"])
-    assert not any(s.operation_type == "routing" for s in adapt_detail(detail).spans)
+
 
 
 @pytest.mark.parametrize("damage", ["catalog", "call_arguments", "call_name", "duplicate_tool_path", "path"])
-def test_ambiguous_skill_identity_is_not_guessed(damage, caplog):
+def test_skill_metadata_conflicts_do_not_generate_skill_diagnostics(damage, caplog):
     detail = skill_detail()
     call = detail["spans"][1]["output"]["tool_calls"][0]
     if damage == "catalog":
@@ -1167,19 +1121,147 @@ def test_ambiguous_skill_identity_is_not_guessed(damage, caplog):
         detail["spans"][2]["input"] = repr(call["args"])
     trace = adapt_detail(detail)
     assert not any(s.operation_type == "routing" for s in trace.spans)
-    assert "inbank_trace_skill_unmapped" in caplog.text
+    assert "inbank_trace_skill_unmapped" not in caplog.text
 
 
-def test_multiple_skills_preserve_call_order_and_deduplicate_message_copies():
+def test_multiple_skill_file_reads_remain_tools_without_routes():
     detail = skill_detail(skills=("text-score", "text-summary"))
     calls = detail["spans"][1]["output"]["tool_calls"]
     calls.append(deepcopy(calls[0]))
     trace = adapt_detail(detail)
     routes = [s for s in trace.spans if s.operation_type == "routing"]
-    assert [s.attributes["selected_skill"] for s in routes] == ["text-score", "text-summary"]
+    assert routes == []
     assert len({s.span_id for s in trace.spans}) == len(trace.spans)
     assert [s.sequence for s in trace.spans] == list(range(len(trace.spans)))
     assert sum(s.operation_type == "tool" for s in trace.spans) == 2
+
+
+@pytest.mark.parametrize("intent", ["hello", "transfer-routing", "账户查询", " transfer-routing \n"])
+def test_yunxia_message_intent_preserves_observed_trace_and_tools(intent):
+    trace = adapt_detail(skill_detail(skills=("hello", "other")))
+    original = trace.model_dump(mode="json")
+    message = {"intent_code": intent, "output": "answer", "slots": {"amount": 42}}
+    original_message = deepcopy(message)
+
+    spans = project_yunxia_intent_selection(trace.spans, message)
+    projected = Trace(**{**trace.model_dump(), "spans": spans})
+
+    assert trace.model_dump(mode="json") == original
+    assert message == original_message
+    assert [s.model_dump(exclude={"sequence"}) for s in spans if s.operation_type != "routing"] == [
+        s.model_dump(exclude={"sequence"}) for s in trace.spans if s.operation_type != "routing"
+    ]
+    routes = [s for s in spans if s.operation_type == "routing"]
+    assert len(routes) == 1
+    route = routes[0]
+    root = spans[0]
+    assert route.attributes["selected_skill"] == intent.strip()
+    assert route.attributes["agentgate.turn.id"] == "first"
+    assert route.attributes["inbank.skill_selection"]["basis"] == "message_intent_code"
+    assert route.attributes["inbank.skill_selection"]["source_path"] == "message.intent_code"
+    assert route.attributes["inbank.skill_selection"]["source_span_id"] == root.span_id
+    assert route.parent_span_id == root.span_id
+    assert route.started_at == route.ended_at == root.ended_at
+    assert route.status == "unset"
+    assert all(s.operation_type != "skill" for s in spans)
+    assert [s.sequence for s in spans] == list(range(len(spans)))
+    assert projected.for_turn("first").spans == spans
+    assert project_yunxia_intent_selection(spans, message) == spans
+
+
+@pytest.mark.parametrize("message", [
+    {}, {"intentCode": "hello"}, {"intent_code": None}, {"intent_code": ""},
+    {"intent_code": " \t\n"}, {"intent_code": 123}, {"intent_code": False},
+    {"intent_code": []}, {"intent_code": {"name": "hello"}},
+])
+def test_yunxia_missing_intent_does_not_fall_back_to_skill_file_or_previous_projection(message):
+    trace = adapt_detail(skill_detail())
+    previous = project_yunxia_intent_selection(trace.spans, {"intent_code": "previous"})
+    for source in (trace.spans, previous):
+        spans = project_yunxia_intent_selection(source, message)
+        assert not any(s.operation_type == "routing" for s in spans)
+        assert sum(s.operation_type == "tool" for s in spans) == 1
+        assert spans[0].attributes == trace.spans[0].attributes
+        Trace(**{**trace.model_dump(), "spans": spans})
+
+
+@pytest.mark.parametrize("trace_available", [True, False])
+@pytest.mark.parametrize("expected,outcome", [("transfer-routing", "pass"), ("other", "fail")])
+def test_yunxia_message_route_is_usable_without_a_skill_read(trace_available, expected, outcome):
+    from test_rule_tool_use import evaluator_spec, resolve_unexpected
+
+    from agentgate.evaluator.rule.routing import SkillRoutingEvaluator
+
+    request = execution_request()
+    turn = request.case.turns[0].model_copy(update={"expectations": (
+        SkillRouteExpectation(condition=Equals(expected=expected)),
+    )})
+    trace = adapt_detail(skill_detail(skills=()), request, turn)
+    turn_spans = trace.spans
+    if not trace_available:
+        root = trace.spans[0]
+        turn_spans = (output_only_turn_span(
+            request, turn, adapter="yunxia", project_id="inbank-tests", request_id="request",
+            started_at=root.started_at, ended_at=root.ended_at,
+            error=TargetExecutionError("unavailable", "trace not found"),
+        ),)
+    message = {"intent_code": "transfer-routing", "output": "answer"}
+    spans = project_yunxia_intent_selection(turn_spans, message)
+    projected = Trace(**{**trace.model_dump(), "spans": spans})
+
+    assert spans[0] == turn_spans[0]
+    assert spans[0].attributes["inbank.evidence_mode"] == (
+        "trace_server" if trace_available else "output_only"
+    )
+    assert not any(s.operation_type in {"tool", "skill"} for s in spans)
+    check = SkillRoutingEvaluator().evaluate(
+        evaluator_spec("skill_routing"), turn, projected.for_turn(turn.id), resolve_unexpected,
+    ).checks[0]
+    assert check.actual == "transfer-routing"
+    assert check.outcome == outcome
+    assert check.span_ids == (spans[1].span_id,)
+
+
+@pytest.mark.parametrize("second_intent", ["hello", "transfer-routing", None])
+def test_yunxia_message_intent_is_scoped_to_each_turn(second_intent):
+    request = execution_request(two_turns=True)
+    spans, outcomes = [], {}
+    for index, turn in enumerate(request.case.turns):
+        detail = skill_detail(f"source-{index}", skills=("hello",) if index == 0 else ())
+        trace = adapt_detail(detail, request, turn)
+        message = {"intent_code": "hello" if index == 0 else second_intent, "output": "answer"}
+        for span in project_yunxia_intent_selection(trace.spans, message):
+            spans.append(span.model_copy(update={"sequence": len(spans)}))
+        outcomes[turn.id] = {"input": turn.input, "output": message, "state": {}}
+    combined = Trace(
+        trace_id=trace.trace_id, run_id=request.run_id, case_id=request.case.id,
+        spans=tuple(spans), turn_outcomes=outcomes,
+        final_output=outcomes["second"]["output"],
+    )
+    for turn_id, expected in [("first", ["hello"]),
+                              ("second", [] if second_intent is None else [second_intent])]:
+        scoped = combined.for_turn(turn_id)
+        routes = [s for s in scoped.spans if s.operation_type == "routing"]
+        assert [s.attributes["selected_skill"] for s in routes] == expected
+        assert all(s.attributes["agentgate.turn.id"] == turn_id for s in routes)
+
+
+def test_yunxia_projection_preserves_customer_routing_spans():
+    trace = adapt_detail(skill_detail())
+    inferred = next(s for s in project_yunxia_intent_selection(
+        trace.spans, {"intent_code": "initial"},
+    ) if s.operation_type == "routing")
+    observed = inferred.model_copy(update={
+        "name": "customer.routing", "span_id": "f" * 16,
+        "attributes": FrozenJsonObject({"selected_skill": "observed", "agentgate.turn.id": "first"}),
+    })
+    source = (*trace.spans, observed)
+    spans = project_yunxia_intent_selection(source, {"intent_code": "reported"})
+    preserved = next(s for s in spans if s.span_id == observed.span_id)
+    assert preserved.model_dump(exclude={"sequence"}) == observed.model_dump(exclude={"sequence"})
+    assert [s.attributes["selected_skill"] for s in spans if s.operation_type == "routing"] == [
+        "reported", "observed",
+    ]
 
 
 def test_existing_rules_consume_adapted_fields_without_new_status_protocol():
@@ -1193,7 +1275,7 @@ def test_existing_rules_consume_adapted_fields_without_new_status_protocol():
         ToolArgumentsEvaluator,
     )
 
-    trace = adapt_detail(skill_detail())
+    trace = reported_intent(adapt_detail(skill_detail()))
     expectations = (
         SkillRouteExpectation(condition=Equals(expected="hello")),
         ToolCallExpectation(tool="read_file"),
@@ -1223,7 +1305,7 @@ def test_existing_judge_request_consumes_adapted_trace_with_redaction(selection)
 
     detail = skill_detail()
     detail["spans"][2]["output"]["content"] = "raw-secret tool result"
-    trace = adapt_detail(detail)
+    trace = reported_intent(adapt_detail(detail))
     built = build_judge_request(
         model_id="mock-only", instruction="Evaluate the provided execution.",
         rubric={"accuracy": "Use the observed evidence."}, case=execution_request().case,
@@ -1267,7 +1349,7 @@ def test_adaptation_keeps_existing_tool_argument_occurrence_semantics(occurrence
     assert check.score == (1.0 if expected == "pass" else 0.0)
 
 
-def test_strict_evidence_assembly_uses_same_skill_and_argument_conversion():
+def test_strict_evidence_assembly_preserves_arguments_without_inferring_skill():
     detail = skill_detail()
     detail["trace"].update(input={"txt": "hello"}, output="answer")
     client = Mock(fetch_events=Mock(return_value=detail_to_events(detail, [])))
@@ -1275,9 +1357,8 @@ def test_strict_evidence_assembly_uses_same_skill_and_argument_conversion():
         execution_request(), "inbank-tests", {"first": fetch(client)},
         {"first": {"input": {"txt": "hello"}, "output": {"output": "answer"}, "state": {}}},
     )
-    route = next(s for s in trace.spans if s.operation_type == "routing")
     tool = next(s for s in trace.spans if s.operation_type == "tool")
-    assert route.attributes["selected_skill"] == "hello"
+    assert not any(s.operation_type == "routing" for s in trace.spans)
     assert tool.attributes["arguments"]["limit"] == 1000
     assert trace.final_output["output"] == "answer"
 
@@ -1291,7 +1372,7 @@ def test_existing_dimension_judge_consumes_adapted_trace_with_mock_only():
     configuration = {**config(), "input_selection": "full_trajectory", "max_input_chars": 100000}
     model = RecordingModel()
     result = execute_evaluators(
-        execution_request().case, adapt_detail(skill_detail()), (spec(configuration),),
+        execution_request().case, reported_intent(adapt_detail(skill_detail())), (spec(configuration),),
         {("answer_quality", "2"): DimensionQualityJudge({"test": model})},
     )[0]
     assert result.outcome == "pass"

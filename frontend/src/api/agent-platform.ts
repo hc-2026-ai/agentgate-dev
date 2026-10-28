@@ -5,6 +5,7 @@ import type {
   PlatformAgent,
   PlatformBranch,
   PlatformCapability,
+  PlatformInitializationVariable,
   PlatformTeam,
   PlatformVersion,
 } from '../views/evaluation/components/AgentTargetPicker.vue';
@@ -327,6 +328,31 @@ function normalizeCapabilities(value: unknown, status: number): PlatformCapabili
   return { tools: normalizedTools, skills: normalizedSkills };
 }
 
+function normalizeInitializationVariables(
+  value: unknown,
+  status: number,
+): PlatformInitializationVariable[] {
+  const data = object(value, status);
+  const config = object(data.agent_config, status);
+  return array(config.nodes ?? [], status).flatMap((raw) => {
+    const node = object(raw, status);
+    if (node.type !== 'Start') return [];
+    const start = object(node.config ?? {}, status);
+    return array(start.variables ?? [], status).flatMap((rawVariable) => {
+      const variable = object(rawVariable, status);
+      const name = text(variable.name, status);
+      if (name === 'BOT_USER_INPUT' || name === 'user_input') return [];
+      return [
+        {
+          name,
+          type: typeof variable.type === 'string' ? variable.type : 'str',
+          required: variable.required === true,
+        },
+      ];
+    });
+  });
+}
+
 // 行内目录：origin 由部署环境配置（VITE_AGENT_PLATFORM_ORIGIN / VITE_ABCCLAW_PLATFORM_ORIGIN，
 // 空值走同源 /web 代理）。行外目录：固定本地虚拟地址（VITE_LOCAL_PLATFORM_ORIGIN 可覆盖）。
 const LOCAL_PLATFORM_ORIGIN: string =
@@ -437,6 +463,25 @@ function createDirectory(
       return normalizeCapabilities(unwrap(response.value, response.status), response.status);
     });
   };
+  const getInitializationVariables: AgentDirectory['getInitializationVariables'] = async ({
+    token,
+    agentId,
+    agentVersion,
+  }) => {
+    return query(token, async (signal) => {
+      const response = await getJson(
+        '/web/agent/getAgentConfigJsonObjectByAgentIdAndVersion',
+        { agentId, agentVersion },
+        token,
+        signal,
+        fixedOrigin,
+      );
+      return normalizeInitializationVariables(
+        unwrap(response.value, response.status),
+        response.status,
+      );
+    });
+  };
   return {
     getTeams,
     getAgents,
@@ -444,6 +489,7 @@ function createDirectory(
     getAgentVersions,
     getBranchVersions,
     getCapabilities,
+    getInitializationVariables,
   };
 }
 

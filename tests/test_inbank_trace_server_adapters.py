@@ -112,9 +112,13 @@ class _Response:
 
 
 class _Transport:
-    def __init__(self, arrange_type: str, *, references: list[list[Any]] | None = None) -> None:
+    def __init__(
+        self, arrange_type: str, *, references: list[list[Any]] | None = None,
+        intent_codes: list[Any] | None = None,
+    ) -> None:
         self.arrange_type = arrange_type
         self.references = references
+        self.intent_codes = intent_codes
         self.chat_count = 0
         self.request_ids = []
         self.deleted = False
@@ -186,7 +190,10 @@ class _Transport:
             message = {
                 "status": "completed",
                 "message": output,
-                "intent_code": "lookup-intent",
+                "intent_code": (
+                    self.intent_codes[self.chat_count - 1]
+                    if self.intent_codes is not None else "lookup-intent"
+                ),
                 "slots": {"city": "上海"},
                 "workflow_calls": [{"id": "workflow-one"}],
             }
@@ -573,7 +580,7 @@ def test_yunxia_final_output_preserves_each_last_message_without_span_copy(
     restored = Trace.model_validate_json(trace.model_dump_json())
     assert restored == trace
     assert trace.final_output.to_dict() == expected_outputs[-1]
-    assert len(trace.spans) == (4 if trace_available else 2)
+    assert len(trace.spans) == (4 if trace_available else 2) + (2 if message_kind == "object" else 0)
     assert [span.sequence for span in trace.spans] == list(range(len(trace.spans)))
     for index, turn_id in enumerate(("turn-1", "turn-2")):
         scoped = restored.for_turn(turn_id)
@@ -587,6 +594,10 @@ def test_yunxia_final_output_preserves_each_last_message_without_span_copy(
         assert restored.turn_outcomes[turn_id]["output"].to_dict() == expected_outputs[index]
         assert all("inbank.response.message_data" not in span.attributes
                    for span in scoped.spans)
+        routes = [span for span in scoped.spans if span.operation_type == "routing"]
+        assert [span.attributes["selected_skill"] for span in routes] == (
+            ["lookup-intent"] if message_kind == "object" else []
+        )
 
 
 @pytest.mark.parametrize("inputs", [
@@ -659,7 +670,7 @@ def test_builds_multiturn_trace_from_trace_server(arrange_type: str) -> None:
         ("customer-agent-id", request_id) for request_id in transport.request_ids for _ in range(3)
     ]
     assert len(set(transport.request_ids)) == 2
-    assert len(result.inline_trace.spans) == 4
+    assert len(result.inline_trace.spans) == (6 if arrange_type == "yunxia" else 4)
     for sequence, turn in enumerate(request.case.turns, 1):
         outcome = result.inline_trace.turn_outcomes[turn.id]
         assert outcome["input"] == turn.input
@@ -674,9 +685,62 @@ def test_builds_multiturn_trace_from_trace_server(arrange_type: str) -> None:
             transport.request_ids[sequence - 1]
         )
         assert turn_trace.spans[0].attributes["trace_sdk.replay"] is False
-        assert turn_trace.spans[1].operation_type == "tool"
-        assert turn_trace.spans[1].name == "lookup"
-        assert turn_trace.spans[1].attributes["arguments"] == {"city": "上海"}
+        tools = [span for span in turn_trace.spans if span.operation_type == "tool"]
+        assert len(tools) == 1
+        assert tools[0].name == "lookup"
+        assert tools[0].attributes["arguments"] == {"city": "上海"}
+
+
+@pytest.mark.parametrize("trace_available", [True, False])
+@pytest.mark.parametrize("second_intent", ["balance", "transfer", None, "", 123])
+def test_yunxia_uses_each_message_intent_without_reading_skill_files(
+    monkeypatch, trace_available, second_intent,
+):
+    from test_rule_routing import evaluator_spec
+
+    from agentgate.domain import Equals, SkillRouteExpectation
+    from agentgate.evaluator.executor import execute_evaluators
+    from agentgate.evaluator.rule.routing import SkillRoutingEvaluator
+
+    transport = _Transport("yunxia", intent_codes=["balance", second_intent])
+    server = _TraceServer()
+    if not trace_available:
+        monkeypatch.setattr(server, "fetch_events", Mock(side_effect=TargetExecutionError(
+            "rejected", "trace not integrated",
+        )))
+    request = _request("yunxia")
+    turns = tuple(turn.model_copy(update={"expectations": (
+        SkillRouteExpectation(condition=Equals(expected=expected)),
+    )}) for turn, expected in zip(request.case.turns, ("balance", "transfer"), strict=True))
+    request = replace(request, case=request.case.model_copy(update={"turns": turns}))
+    adapter = _adapter("yunxia", transport, server)
+    try:
+        result = adapter.wait(adapter.start(request), 30)
+    finally:
+        adapter.close()
+    assert result.error is None
+    assert transport.chat_count == 2 and transport.deleted
+    trace = result.inline_trace
+    assert all(span.name != "read_file" for span in trace.spans)
+    for turn, intent in zip(turns, ("balance", second_intent), strict=True):
+        scoped = trace.for_turn(turn.id)
+        assert scoped.final_output["intent_code"] == intent
+        assert scoped.final_output["message"] == "customer answer"
+        assert scoped.spans[0].attributes["inbank.evidence_mode"] == (
+            "trace_server" if trace_available else "output_only"
+        )
+        routes = [s for s in scoped.spans if s.operation_type == "routing"]
+        assert [s.attributes["selected_skill"] for s in routes] == (
+            [intent] if isinstance(intent, str) and intent else []
+        )
+        assert all(s.attributes["inbank.skill_selection"]["source_path"] == "message.intent_code"
+                   for s in routes)
+    evaluation = execute_evaluators(
+        request.case, trace, (evaluator_spec(),), {("skill_routing", "1"): SkillRoutingEvaluator()},
+    )[0]
+    second_outcome = "pass" if second_intent == "transfer" else "fail"
+    assert [c.turn_id for c in evaluation.checks] == [turn.id for turn in turns]
+    assert [c.outcome.value for c in evaluation.checks] == ["pass", second_outcome]
 
 
 @pytest.mark.parametrize("arrange_type", ["base", "workflow", "yunxia"])
@@ -773,7 +837,7 @@ def test_sse_trace_references_are_not_used_for_query_binding(arrange_type, refer
     trace = result.inline_trace
     assert trace.final_output["message" if arrange_type == "yunxia" else "output"] == "customer answer"
     assert len(trace.turn_outcomes) == transport.chat_count == 2
-    assert len(trace.spans) == 4
+    assert len(trace.spans) == (6 if arrange_type == "yunxia" else 4)
     assert all(span.attributes["inbank.evidence_mode"] == "trace_server"
                for span in trace.spans if span.operation_type == "turn")
     assert adapter.get_status("execution-1") is CaseExecutionStatus.COMPLETED
@@ -810,6 +874,7 @@ def test_trace_or_output_fallback_does_not_hide_later_chat_failure(arrange_type,
         ] == "customer answer"
         failed = result.inline_trace.for_turn("turn-2")
         assert failed.final_output == {}
+        assert not any(span.operation_type == "routing" for span in failed.spans)
         assert failed.spans[0].status == "error"
         assert failed.spans[0].attributes["agentgate.execution.error"]["code"] == "rejected"
         assert adapter.get_status("execution-1") is CaseExecutionStatus.FAILED
@@ -820,7 +885,7 @@ def test_trace_or_output_fallback_does_not_hide_later_chat_failure(arrange_type,
 
 @pytest.mark.parametrize("arrange_type", ["base", "workflow", "yunxia"])
 @pytest.mark.parametrize("failure", ["unavailable", "not-found", "empty", "wrong-trace", "failed-trace"])
-def test_trace_failure_keeps_output_without_synthetic_evidence(arrange_type, failure, monkeypatch, caplog):
+def test_trace_failure_keeps_output_without_synthetic_execution_spans(arrange_type, failure, monkeypatch, caplog):
     caplog.set_level(logging.INFO)
     transport = _Transport(arrange_type)
     trace_server = _TraceServer()
@@ -849,11 +914,13 @@ def test_trace_failure_keeps_output_without_synthetic_evidence(arrange_type, fai
         result = adapter.wait(adapter.start(_request(arrange_type)), 30)
         assert adapter.get_status("execution-1") is CaseExecutionStatus.COMPLETED
         trace = result.inline_trace
-        assert len(trace.spans) == 2
+        assert len(trace.spans) == (4 if arrange_type == "yunxia" else 2)
+        assert not any(span.operation_type in {"tool", "llm", "skill"} for span in trace.spans)
         assert trace.final_output["message" if arrange_type == "yunxia" else "output"] == "customer answer"
         assert trace.final_state == {}
         assert all(outcome["state"] == {} for outcome in trace.turn_outcomes.values())
-        for span, request_id in zip(trace.spans, transport.request_ids, strict=True):
+        roots = [span for span in trace.spans if span.operation_type == "turn"]
+        for span, request_id in zip(roots, transport.request_ids, strict=True):
             assert span.operation_type == "turn"
             assert span.attributes["inbank.evidence_mode"] == "output_only"
             assert span.attributes["inbank.request_id"] == request_id
@@ -953,7 +1020,7 @@ def test_trace_permanent_rejection_does_not_retry(arrange_type, status, monkeypa
     try:
         trace = adapter.wait(adapter.start(_request(arrange_type)), 30).inline_trace
         assert all(s.attributes["inbank.trace_fallback_detail"] == f"trace server HTTP {status}"
-                   for s in trace.spans)
+                   for s in trace.spans if s.operation_type == "turn")
         assert adapter.get_status("execution-1") is CaseExecutionStatus.COMPLETED
     finally:
         adapter.close()
@@ -1051,11 +1118,13 @@ def test_sparse_root_never_repairs_or_fabricates_source_spans(arrange_type, prob
     )
     try:
         trace = adapter.wait(adapter.start(_request(arrange_type)), 30).inline_trace
-        assert len(trace.spans) == 2
-        assert all(s.operation_type == "turn" and s.attributes["inbank.evidence_mode"] == "output_only"
-                   for s in trace.spans)
+        assert len(trace.spans) == (4 if arrange_type == "yunxia" else 2)
+        assert not any(s.operation_type in {"tool", "llm", "skill"} for s in trace.spans)
+        roots = [s for s in trace.spans if s.operation_type == "turn"]
+        assert len(roots) == 2
+        assert all(s.attributes["inbank.evidence_mode"] == "output_only" for s in roots)
         assert all(s.attributes["inbank.trace_fallback_reason"] == (
-            "timeout" if problem == "empty" else "protocol_error") for s in trace.spans)
+            "timeout" if problem == "empty" else "protocol_error") for s in roots)
     finally:
         adapter.close()
     assert transport.deleted
@@ -1107,13 +1176,15 @@ def test_export_boundary_keeps_seven_real_spans_and_observations_per_turn(arrang
     assert len(queried) == 6 and transport.deleted
     for turn in request.case.turns:
         spans = result.inline_trace.for_turn(turn.id).spans
-        assert len(spans) == 8  # Seven source spans plus the existing turn wrapper.
+        # Seven source spans, the turn wrapper, and Yunxia's reported route.
+        assert len(spans) == (9 if arrange_type == "yunxia" else 8)
         wrapper = next(s for s in spans if s.operation_type == "turn")
         assert wrapper.attributes["inbank.evidence_mode"] == "trace_server"
         assert wrapper.attributes["inbank.trace_source"]["unreturned_parent_span_ids"] == (
             "outer-first", "outer-second",
         )
-        by_source = {s.attributes["trace_sdk.span_id"]: s for s in spans if s is not wrapper}
+        by_source = {s.attributes["trace_sdk.span_id"]: s for s in spans
+                     if "trace_sdk.span_id" in s.attributes}
         assert set(by_source) == {row[0] for row in rows}
         for sid, parent, *_ in rows:
             span = by_source[sid]
@@ -1153,8 +1224,10 @@ def test_trace_readiness_deadline_falls_back_and_cleans_up(
     )
     try:
         trace = adapter.wait(adapter.start(_request(arrange_type)), 30).inline_trace
-        assert all(s.attributes["inbank.evidence_mode"] == "output_only" for s in trace.spans)
-        assert all("not ready within 10s" in s.attributes["inbank.trace_fallback_detail"] for s in trace.spans)
+        roots = [s for s in trace.spans if s.operation_type == "turn"]
+        assert len(roots) == 2
+        assert all(s.attributes["inbank.evidence_mode"] == "output_only" for s in roots)
+        assert all("not ready within 10s" in s.attributes["inbank.trace_fallback_detail"] for s in roots)
         assert adapter.get_status("execution-1") is CaseExecutionStatus.COMPLETED
     finally:
         adapter.close()
@@ -1185,7 +1258,8 @@ def test_each_turn_preserves_its_own_evidence_mode(arrange_type, missing_turn, m
             assert evidence.spans[0].attributes["inbank.evidence_mode"] == (
                 "output_only" if index == missing_turn else "trace_server"
             )
-            assert sum(s.operation_type != "turn" for s in evidence.spans) == (index != missing_turn)
+            assert sum(s.operation_type == "tool" for s in evidence.spans) == (index != missing_turn)
+            assert len(evidence.spans) == 1 + (index != missing_turn) + (arrange_type == "yunxia")
             assert evidence.final_output[
                 "message" if arrange_type == "yunxia" else "output"
             ] == "customer answer"
@@ -1339,10 +1413,13 @@ def test_adapted_multicase_multiturn_evidence_reaches_rules_judge_and_saved_repo
         turns = []
         for turn_index in range(2):
             name = f"skill-{case_index * 2 + turn_index + 1}"
+            route_expectations = (
+                ({"kind": "skill_route", "condition": {"kind": "equals", "expected": f"reported-{name}"}},)
+                if arrange_type == "yunxia" else ()
+            )
             turns.append(CaseTurn(
                 id=f"turn-{turn_index + 1}", input={"txt": f"case-{case_index} turn-{turn_index}"},
-                expectations=(
-                    {"kind": "skill_route", "condition": {"kind": "equals", "expected": name}},
+                expectations=route_expectations + (
                     {"kind": "tool_call", "tool": "read_file"},
                     {"kind": "tool_call", "tool": "delete", "mode": "forbidden"},
                     {"kind": "tool_argument", "tool": "read_file", "path": "arguments.file_path",
@@ -1373,10 +1450,11 @@ def test_adapted_multicase_multiturn_evidence_reaches_rules_judge_and_saved_repo
     evaluators.publish_draft(judge.id)
     evaluators.update_evaluator(judge.id, enabled=True)
     runs = RunManagement(repo, evaluators)
-    run = runs.create_run(target, dataset_id=dataset.id, evaluator_ids=[
-        "skill-routing", "required-tool", "forbidden-tool", "tool-arguments", "final-output", "final-state", judge.id,
-    ])
-    transport = _Transport(arrange_type)
+    selected_evaluators = (["skill-routing"] if arrange_type == "yunxia" else []) + [
+        "required-tool", "forbidden-tool", "tool-arguments", "final-output", "final-state", judge.id,
+    ]
+    run = runs.create_run(target, dataset_id=dataset.id, evaluator_ids=selected_evaluators)
+    transport = _Transport(arrange_type, intent_codes=[f"reported-skill-{i}" for i in range(1, 5)])
     trace_server = SkillTraceServer()
     adapter = _adapter(arrange_type, transport, trace_server)
     resolver = resolve_yunxia_trace if arrange_type == "yunxia" else resolve_chatabc_trace
@@ -1386,7 +1464,7 @@ def test_adapted_multicase_multiturn_evidence_reaches_rules_judge_and_saved_repo
         adapter.close()
     assert completed.status.value == "completed"
     report = ResultReader(repo).get_report(run.id)
-    assert len(report.results) == 14
+    assert len(report.results) == 2 * len(selected_evaluators)
     assert all(result.outcome.value == "pass" for result in report.results)
     assert len(model.requests) == 2
     assert len(trace_server.calls) == 20
@@ -1401,18 +1479,27 @@ def test_adapted_multicase_multiturn_evidence_reaches_rules_judge_and_saved_repo
         for turn_index in range(2):
             turn_trace = trace.for_turn(f"turn-{turn_index + 1}")
             assert turn_trace.final_state == {"execution_status": "success"}
-            route = next(s for s in turn_trace.spans if s.operation_type == "routing")
+            routes = [s for s in turn_trace.spans if s.operation_type == "routing"]
             tool = next(s for s in turn_trace.spans if s.operation_type == "tool")
             name = f"skill-{case_index * 2 + turn_index + 1}"
-            assert route.attributes["selected_skill"] == name
+            if arrange_type == "yunxia":
+                assert len(routes) == 1
+                route = routes[0]
+                assert route.attributes["selected_skill"] == f"reported-{name}"
+                assert route.attributes["inbank.skill_selection"]["basis"] == "message_intent_code"
+                assert route.span_id not in seen_route_ids
+                seen_route_ids.add(route.span_id)
+            else:
+                assert routes == []
             assert tool.attributes["arguments"]["file_path"].endswith(f"/{name}/SKILL.md")
             assert tool.attributes["tool_call_id"] == "call-0"  # Same source ID in every turn.
-            assert route.span_id not in seen_route_ids
-            seen_route_ids.add(route.span_id)
         prompt = model.requests[case_index].user_prompt
-        assert f'"selected_skill":"skill-{case_index * 2 + 1}"' in prompt
-        assert f'"selected_skill":"skill-{case_index * 2 + 2}"' in prompt
-        assert f'"selected_skill":"skill-{(1 - case_index) * 2 + 1}"' not in prompt
+        if arrange_type == "yunxia":
+            assert f'"selected_skill":"reported-skill-{case_index * 2 + 1}"' in prompt
+            assert f'"selected_skill":"reported-skill-{case_index * 2 + 2}"' in prompt
+            assert f'"selected_skill":"reported-skill-{(1 - case_index) * 2 + 1}"' not in prompt
+        else:
+            assert '"selected_skill"' not in prompt
 
 
 @pytest.mark.parametrize("arrange_type", ["base", "workflow", "yunxia"])
@@ -1552,9 +1639,13 @@ def test_unstable_snapshot_times_out_without_synthetic_tools(arrange_type, probl
         adapter.close()
     assert transport.chat_count == 2 and transport.deleted
     assert len(queries) == 10 and clock.now == 20
-    assert len(trace.spans) == 2
+    assert len(trace.spans) == (4 if arrange_type == "yunxia" else 2)
+    assert not any(span.operation_type in {"tool", "llm", "skill"} for span in trace.spans)
     assert trace.final_output["message" if arrange_type == "yunxia" else "output"] == "customer answer"
     for span in trace.spans:
+        if span.operation_type == "routing":
+            assert span.attributes["inbank.skill_selection"]["basis"] == "message_intent_code"
+            continue
         assert span.operation_type == "turn"
         assert span.attributes["inbank.evidence_mode"] == "output_only"
         assert span.attributes["inbank.trace_fallback_reason"] == "timeout"
@@ -1731,7 +1822,7 @@ def test_configured_trace_wait_handles_delayed_evidence_per_turn(
         else:
             assert root.attributes["inbank.trace_fallback_reason"] == "timeout"
             assert f"within {budget:g}s" in root.attributes["inbank.trace_fallback_detail"]
-            assert len(scoped.spans) == 1
+            assert len(scoped.spans) == (2 if arrange_type == "yunxia" else 1)
 
 
 @pytest.mark.parametrize("arrange_type", ["base", "workflow", "yunxia"])

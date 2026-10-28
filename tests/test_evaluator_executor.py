@@ -14,12 +14,14 @@ from agentgate.domain import (
     JudgeRecord,
     Outcome,
     OutputExpectation,
+    SkillRouteExpectation,
     Trace,
     TraceSpan,
 )
 from agentgate.evaluator.executor import execute_evaluators
 from agentgate.evaluator.models import CheckDraft, Evaluation, FailureCandidate
 from agentgate.evaluator.rule.output import FinalOutputEvaluator
+from agentgate.evaluator.rule.routing import SkillRoutingEvaluator
 
 
 def evaluator_spec(
@@ -79,21 +81,34 @@ def passing_evaluation(name: str = "check") -> Evaluation:
     )
 
 
-def output_only_trace() -> Trace:
+def output_only_trace(*, reported_intent: str | None = None) -> Trace:
+    spans = [TraceSpan(
+        trace_id="0" * 32, span_id="1" * 16, name="inbank.turn",
+        operation_type="turn", sequence=0, status="ok",
+        attributes={"agentgate.turn.id": "turn", "inbank.evidence_mode": "output_only"},
+    )]
+    if reported_intent is not None:
+        spans.append(TraceSpan(
+            trace_id="0" * 32, span_id="2" * 16, parent_span_id="1" * 16,
+            name="inbank.yunxia.skill_selection", operation_type="routing", sequence=1,
+            attributes={
+                "agentgate.turn.id": "turn", "selected_skill": reported_intent,
+                "inbank.skill_selection": {
+                    "derived": True, "basis": "message_intent_code",
+                    "source_span_id": "1" * 16, "source_path": "message.intent_code",
+                },
+            },
+        ))
     return Trace(
         trace_id="0" * 32, run_id="run", case_id="case",
-        spans=(TraceSpan(
-            trace_id="0" * 32, span_id="1" * 16, name="inbank.turn",
-            operation_type="turn", sequence=0, status="ok",
-            attributes={"agentgate.turn.id": "turn", "inbank.evidence_mode": "output_only"},
-        ),),
+        spans=tuple(spans),
         final_output={"output": "hello"},
         turn_outcomes={"turn": {"output": {"output": "hello"}, "state": {}}},
     )
 
 
 @pytest.mark.parametrize("implementation_id", [
-    "required_tool", "forbidden_tool", "tool_arguments", "skill_routing",
+    "required_tool", "forbidden_tool", "tool_arguments",
     "execution_path", "policy_compliance", "final_state",
 ])
 def test_output_only_skips_trace_rules_instead_of_claiming_pass_or_fail(implementation_id, caplog):
@@ -112,15 +127,81 @@ def test_output_only_skips_trace_rules_instead_of_claiming_pass_or_fail(implemen
     assert "inbank_evaluation_skipped" in caplog.text
 
 
+@pytest.mark.parametrize("expected, outcome", [("balance", Outcome.PASS), ("transfer", Outcome.FAIL)])
+@pytest.mark.parametrize("evidence_mode", ["trace_server", "output_only"])
+def test_reported_yunxia_intent_is_evaluated_in_both_evidence_modes(expected, outcome, evidence_mode):
+    sample = Case(id="case", name="case", turns=(CaseTurn(
+        id="turn", input={"txt": "hello"}, expectations=(SkillRouteExpectation(
+            condition={"kind": "equals", "expected": expected},
+        ),),
+    ),))
+    evidence = output_only_trace(reported_intent="balance")
+    root = evidence.spans[0].model_copy(update={"attributes": {
+        **evidence.spans[0].attributes, "inbank.evidence_mode": evidence_mode,
+    }})
+    evidence = evidence.model_copy(update={"spans": (root, *evidence.spans[1:])})
+    result, = execute_evaluators(
+        sample, evidence,
+        (evaluator_spec("routing", "skill_routing"),),
+        {("skill_routing", "1"): SkillRoutingEvaluator()},
+    )
+    assert result.outcome == outcome
+    assert result.checks[0].turn_id == "turn"
+    assert result.checks[0].actual == "balance"
+    assert result.checks[0].span_ids == ("2" * 16,)
+
+
+@pytest.mark.parametrize("evidence_mode", ["trace_server", "output_only"])
+def test_missing_yunxia_intent_is_missing_routing_in_both_evidence_modes(evidence_mode, caplog):
+    sample = Case(id="case", name="case", turns=(CaseTurn(
+        id="turn", input={"txt": "hello"}, expectations=(SkillRouteExpectation(
+            condition={"kind": "equals", "expected": "balance"},
+        ),),
+    ),))
+    evidence = output_only_trace()
+    root = evidence.spans[0].model_copy(update={"attributes": {
+        **evidence.spans[0].attributes, "inbank.evidence_mode": evidence_mode,
+    }})
+    evidence = evidence.model_copy(update={"spans": (root,)})
+    result, = execute_evaluators(
+        sample, evidence, (evaluator_spec("routing", "skill_routing"),),
+        {("skill_routing", "1"): SkillRoutingEvaluator()},
+    )
+    assert result.outcome == Outcome.FAIL
+    assert result.score == 0
+    assert result.checks[0].actual_missing
+    assert result.checks[0].reason == "未产生路由决策"
+    assert "inbank_evaluation_skipped" not in caplog.text
+
+
+@pytest.mark.parametrize("implementation_id", [
+    "required_tool", "forbidden_tool", "tool_arguments", "execution_path",
+    "policy_compliance", "final_state",
+])
+def test_reported_intent_does_not_supply_missing_execution_evidence(implementation_id):
+    implementation = Mock(
+        kind=EvaluatorKind.RULE, implementation_id=implementation_id, implementation_version="1",
+    )
+    implementation.applies_to.return_value = True
+    result, = execute_evaluators(
+        case(), output_only_trace(reported_intent="balance"),
+        (evaluator_spec("check", implementation_id),), {(implementation_id, "1"): implementation},
+    )
+    implementation.evaluate.assert_not_called()
+    assert result.outcome == Outcome.NOT_APPLICABLE and result.score is None
+    assert result.checks[0].actual_missing
+
+
 @pytest.mark.parametrize("expected, outcome", [("hello", Outcome.PASS), ("wrong", Outcome.FAIL)])
-def test_output_only_still_evaluates_actual_final_answer(expected, outcome):
+@pytest.mark.parametrize("reported_intent", [None, "balance"])
+def test_output_only_still_evaluates_actual_final_answer(expected, outcome, reported_intent):
     sample = Case(id="case", name="case", turns=(CaseTurn(
         id="turn", input={"txt": "hi"}, expectations=(OutputExpectation(
             id="answer", path="output", condition={"kind": "equals", "expected": expected},
         ),),
     ),))
     result, = execute_evaluators(
-        sample, output_only_trace(), (evaluator_spec("output", "final_output"),),
+        sample, output_only_trace(reported_intent=reported_intent), (evaluator_spec("output", "final_output"),),
         {("final_output", "1"): FinalOutputEvaluator()},
     )
     assert result.outcome == outcome
@@ -128,7 +209,8 @@ def test_output_only_still_evaluates_actual_final_answer(expected, outcome):
 
 
 @pytest.mark.parametrize("selection", [None, "final_output", "output_and_tools", "full_trajectory"])
-def test_output_only_judge_requires_requested_evidence(selection):
+@pytest.mark.parametrize("reported_intent", [None, "balance"])
+def test_output_only_judge_requires_requested_evidence(selection, reported_intent):
     spec = evaluator_spec("judge", "answer_quality", kind=EvaluatorKind.LLM_JUDGE)
     if selection:
         spec = EvaluatorSpec(**{
@@ -145,7 +227,8 @@ def test_output_only_judge_requires_requested_evidence(selection):
         ),
     })
     result, = execute_evaluators(
-        case(), output_only_trace(), (spec,), {("answer_quality", "1"): implementation},
+        case(), output_only_trace(reported_intent=reported_intent), (spec,),
+        {("answer_quality", "1"): implementation},
     )
     if selection in {None, "final_output"}:
         implementation.evaluate_case.assert_called_once()

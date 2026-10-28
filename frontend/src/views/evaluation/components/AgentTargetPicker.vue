@@ -40,6 +40,11 @@ export interface PlatformCapability {
     tools: string[];
   }[];
 }
+export interface PlatformInitializationVariable {
+  name: string;
+  type: string;
+  required: boolean;
+}
 export interface AgentTargetSelection {
   localTarget?: LocalTarget;
   teamId: string;
@@ -72,6 +77,11 @@ export interface AgentDirectory {
     agentVersion: string;
     branchId?: string | null;
   }): Promise<PlatformCapability>;
+  getInitializationVariables?(input: {
+    token: string;
+    agentId: string;
+    agentVersion: string;
+  }): Promise<readonly PlatformInitializationVariable[]>;
 }
 </script>
 

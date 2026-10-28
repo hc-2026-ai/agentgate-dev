@@ -81,6 +81,15 @@ function activate() {
     </div>
     <h2 class="group-template-title">{{ card.name }}</h2>
     <p>{{ card.description || '暂无备注描述' }}</p>
+    <div class="evaluator-metadata">
+      <div class="group-template-tags"><span>LLM</span><span>文本</span><span>内容质量</span></div>
+      <div v-if="evaluator && action === 'view'" class="asset-chips evaluator-version-status">
+        <span v-if="evaluator.latest_version" class="asset-chip" title="最新已发布版本">
+          V{{ evaluator.latest_version }}
+        </span>
+        <span v-if="evaluator.has_draft" class="asset-chip preview">未发布草稿</span>
+      </div>
+    </div>
     <p v-if="loading" role="status">正在读取评估配置…</p>
     <p v-else-if="error" role="alert">
       {{ error }} <button class="asset-link" @click="load">重试</button>
@@ -124,6 +133,24 @@ function activate() {
 }
 .llm-group-template-card .asset-card-actions {
   min-height: 54px;
+}
+.evaluator-metadata {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.group-template-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.group-template-tags span {
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color);
+  border-radius: 3px;
+  padding: 3px 6px;
+  font-size: 10px;
 }
 .llm-group-template-card h4 {
   margin: 0;
