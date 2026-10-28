@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from agentgate.domain import (
     EvaluationRun,
@@ -18,18 +18,17 @@ from agentgate.domain import (
     transition_run,
     utcnow,
 )
+from agentgate.domain.run import RunTiming
 from agentgate.integrations.job_dispatchers import JobDispatcher
 from agentgate.run.engine import RunEngine, TraceResolver
-from agentgate.run.retry import retry_delay_seconds
 from agentgate.run.target_protocol import TargetAdapterProtocol
 from agentgate.server.user_context import get_user_info
 from agentgate.storage.repository import AgentGateRepository
 
 from .dataset_management import DatasetManagement
 from .evaluator_management import EvaluatorManagement
-from .run_scheduling import MAX_CONCURRENT_RUNS_PER_API_KEY, MAX_DISPATCH_ATTEMPTS
+from .run_scheduling import MAX_CONCURRENT_RUNS_PER_API_KEY, MAX_DISPATCH_ATTEMPTS, RunScheduling
 from .target_catalog import TargetCatalog
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -119,6 +118,7 @@ class RunManagement:
                 else RunStatus.PENDING
             ),
             created_at=created_at,
+            timing=RunTiming(pending_started_at=created_at if normalized_schedule is None else None),
             scheduled_for=normalized_schedule,
             user_team_id=user_team_id,
             user_id=user_id,
@@ -160,6 +160,7 @@ class RunManagement:
             )
 
         rerun = EvaluationRun(
+            timing=RunTiming(pending_started_at=utcnow()),
             manifest=source.manifest,
             user_team_id=source.user_team_id,
             user_id=source.user_id,
@@ -303,46 +304,8 @@ class RunManagement:
         now: datetime | None = None,
         grace_seconds: float = 30,
     ) -> list[EvaluationRun]:
-        """Fail running Runs whose execution recovery deadline has expired."""
+        """Recover pending and running Runs whose deadlines have expired."""
 
-        if grace_seconds < 0:
-            raise ValueError("grace_seconds must not be negative")
-        current_time = normalize_utc(now or utcnow(), "stale Run check time")
-        failed_runs: list[EvaluationRun] = []
-        for run in self.repository.list_runs_by_status(RunStatus.RUNNING):
-            case_count = len(run.manifest.execution_cases)
-            batch_count = (
-                case_count + run.manifest.max_parallel_cases - 1
-            ) // run.manifest.max_parallel_cases
-            retry_delay_budget = sum(
-                retry_delay_seconds(retry_number)
-                for retry_number in range(1, run.manifest.max_retries + 1)
-            )
-            execution_seconds = (
-                run.manifest.timeout_seconds * batch_count
-                + case_count
-                * (
-                    run.manifest.timeout_seconds * run.manifest.max_retries
-                    + retry_delay_budget
-                )
-            )
-            deadline = run.started_at + timedelta(
-                seconds=execution_seconds + grace_seconds
-            )
-            if deadline > current_time:
-                continue
-            failed = transition_run(
-                run,
-                RunStatus.FAILED,
-                occurred_at=current_time,
-                error="Execution worker exceeded its recovery deadline",
-            )
-            try:
-                self.repository.save_run(failed)
-            except ValueError:
-                current = self.repository.get_run(run.id)
-                if current is None or current.status is RunStatus.RUNNING:
-                    raise
-                continue
-            failed_runs.append(failed)
-        return failed_runs
+        return RunScheduling(self.repository).recover_stale_runs(
+            now=now, grace_seconds=grace_seconds
+        )

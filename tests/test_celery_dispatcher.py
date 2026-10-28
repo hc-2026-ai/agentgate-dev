@@ -207,6 +207,10 @@ def test_scheduler_task_uses_configured_database_and_dispatcher(tmp_path, monkey
         def __init__(self, repository) -> None:
             calls.append(repository.path)
 
+        def recover_stale_runs(self, dispatcher):
+            calls.append("recover")
+            return []
+
         def dispatch_due_runs(self, dispatcher):
             calls.append(type(dispatcher).__name__)
             return (object(), object())
@@ -220,7 +224,7 @@ def test_scheduler_task_uses_configured_database_and_dispatcher(tmp_path, monkey
     )
 
     assert dispatch_due_evaluation_runs.run() == 2
-    assert calls == [str(database_path), "CeleryJobDispatcher"]
+    assert calls == [str(database_path), "recover", "CeleryJobDispatcher"]
 
 
 def test_worker_executes_persisted_run_and_duplicate_is_noop(tmp_path, monkeypatch) -> None:

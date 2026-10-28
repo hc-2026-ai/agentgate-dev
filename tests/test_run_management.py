@@ -28,6 +28,7 @@ from agentgate.domain import (
     RunStatus,
     TargetSnapshot,
     transition_run,
+    utcnow,
 )
 from agentgate.evaluator.models import DuplicateEvaluatorId, UnknownEvaluator
 from agentgate.integrations.observability import InMemoryTraceCapture
@@ -813,3 +814,18 @@ def test_create_run_rejects_invalid_case_subset(tmp_path) -> None:
         )
 
     assert repository.list_runs(user_team_id="") == []
+
+
+def test_created_run_records_pending_time_and_rerun_gets_new_clock(tmp_path):
+    repository = SQLiteRepository(tmp_path / "pending-clock.db")
+    seed_demo(repository)
+    management, _ = run_management(repository)
+    run = management.create_run(target(), dataset_id=LOAN_DATASET.id)
+    assert run.timing.pending_started_at == run.created_at
+    assert repository.get_run(run.id).timing == run.timing
+    failed = transition_run(run, RunStatus.FAILED, error="test failure")
+    repository.save_run(failed)
+    rerun = management.create_rerun(run.id)
+    assert rerun.timing.pending_started_at > run.timing.pending_started_at
+    scheduled = management.create_run(target(), dataset_id=LOAN_DATASET.id, scheduled_for=utcnow() + timedelta(hours=1))
+    assert scheduled.timing.pending_started_at is None

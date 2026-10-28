@@ -260,6 +260,7 @@ def submit_platform_evaluation(
             EvaluationRun(
                 id=task_id if index == 0 else str(uuid4()),
                 manifest=run.manifest,
+                timing=run.timing,
                 status=run.status,
                 scheduled_for=run.scheduled_for,
                 user_team_id=user_team_id,
@@ -420,6 +421,7 @@ def submit_platform_comparison(
                 EvaluationRun(
                     id=(task_id if not prepared else str(uuid4())),
                     manifest=run.manifest,
+                timing=run.timing,
                     status=run.status,
                     scheduled_for=run.scheduled_for,
                     user_team_id=user_team_id,

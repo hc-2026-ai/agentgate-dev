@@ -125,3 +125,38 @@ def test_standalone_scheduler_needs_no_celery_and_submits_once(tmp_path, local_b
     assert requests == [{"taskId": [run.id], "jobId": ["ai11"]}]
     assert repository.get_run(run.id).status is RunStatus.PENDING
     assert repository.get_run(future.id).status is RunStatus.SCHEDULED
+
+
+@pytest.mark.parametrize("entry", ["celery", "standalone"])
+def test_scheduler_entry_recovers_pending_before_dispatch(tmp_path, monkeypatch, local_bjs, entry):
+    from agentgate.domain.run import RunTiming
+    from agentgate.domain import transition_run
+
+    url, requests = local_bjs
+    repository = SQLiteRepository(tmp_path / "recovery.db")
+    expired = due_run(repository)
+    claimed, = repository.claim_due_scheduled_runs(utcnow())
+    old_clock = utcnow() - timedelta(hours=1)
+    repository.save_run(claimed.model_copy(update={"timing": RunTiming(pending_started_at=old_clock)}))
+    queued = expired.model_copy(update={"id": "waiting-run"})
+    repository.save_run(queued)
+    claimed, = repository.claim_due_scheduled_runs(utcnow())
+    repository.save_run(transition_run(claimed, RunStatus.WAITING))
+    config = {
+        "AGENTGATE_DB_TYPE": "sqlite", "AGENTGATE_DB": str(repository.path),
+        "AGENT_TASK_DISPATCHER_TYPE": "bjs", "AGENTGATE_BJS_SUBMIT_URL": url,
+        "AGENTGATE_BJS_JOB_ID": "ai11", "AGENTGATE_PENDING_TIMEOUT_SECONDS": "60",
+        "AGENTGATE_MAX_CONCURRENT_RUNS_PER_API_KEY": "1",
+    }
+    if entry == "standalone":
+        root = prepare_script_tree(tmp_path, config)
+        result = run_script(root, "dispatch-due")
+        assert result.returncode == 0, result.stderr
+    else:
+        for name, value in config.items():
+            monkeypatch.setenv(name, value)
+        monkeypatch.setattr(run_scheduling, "MAX_CONCURRENT_RUNS_PER_API_KEY", 1)
+        assert dispatch_due_evaluation_runs.run() == 1
+    assert repository.get_run(expired.id).status is RunStatus.FAILED
+    assert repository.get_run(queued.id).status is RunStatus.PENDING
+    assert requests == [{"taskId": [queued.id], "jobId": ["ai11"]}]

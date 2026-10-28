@@ -212,7 +212,7 @@ class ServerDependencies:
         template = self._create_demo_run(version, persist=False, **settings)
         if template.status != RunStatus.PENDING:
             raise ValueError("stability does not support scheduling")
-        runs = [template, *(EvaluationRun(manifest=template.manifest,
+        runs = [template, *(EvaluationRun(timing=template.timing, manifest=template.manifest,
             user_team_id=template.user_team_id, user_id=template.user_id,
             user_name=template.user_name, api_key=template.api_key)
             for _ in range(repetitions - 1))]

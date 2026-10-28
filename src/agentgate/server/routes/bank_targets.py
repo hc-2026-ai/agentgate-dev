@@ -76,7 +76,7 @@ def launch(request: BankLaunch, dependencies: Dependencies):
             for turn in case.turns:
                 if set(turn.input) != {"txt"} or not isinstance(turn.input["txt"], str) or not 1 <= len(turn.input["txt"].strip()) <= 4000:
                     raise ValueError("bank turns require nonblank txt up to 4000 characters")
-        runs = [run, *(EvaluationRun(manifest=run.manifest, user_team_id=run.user_team_id,
+        runs = [run, *(EvaluationRun(timing=run.timing, manifest=run.manifest, user_team_id=run.user_team_id,
             user_id=run.user_id, user_name=run.user_name, api_key=run.api_key)
             for _ in range(request.repetitions - 1))]
         task = EvaluationTask(id=run.id, name=request.name.strip() if request.name else None, kind="stability" if request.repetitions > 1 else "single", run_ids=tuple(r.id for r in runs))

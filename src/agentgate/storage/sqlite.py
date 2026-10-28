@@ -35,6 +35,7 @@ from agentgate.domain import (
 )
 from agentgate.domain.credential import ApiKeyMetadata
 from agentgate.domain.evaluation_task import EvaluationTask, task_with_rerun
+from agentgate.domain.run import RunTiming
 from agentgate.evaluator.versioning import (
     publish_evaluator_draft as build_evaluator_publication,
 )
@@ -1636,6 +1637,7 @@ class SQLiteRepository:
 
     def save_run(self, run: EvaluationRun) -> None:
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
                 f"SELECT payload FROM {_T_RUNS} WHERE id = ?", (run.id,)
             ).fetchone()
@@ -2066,6 +2068,29 @@ class SQLiteRepository:
         for row in rows:
             counts[RunStatus(row["status"])] = row["count"]
         return counts
+
+    def recover_run(
+        self, expected: EvaluationRun, *, now: datetime, error: str | None = None
+    ) -> EvaluationRun | None:
+        now = normalize_utc(now, "Run recovery time")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(f"SELECT payload FROM {_T_RUNS} WHERE id=?", (expected.id,)).fetchone()
+            stored = EvaluationRun.model_validate_json(row[0]) if row else None
+            if stored != expected or stored.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
+                return None
+            if error is None:
+                if stored.status is not RunStatus.PENDING or stored.timing.pending_started_at is not None:
+                    return None
+                recovered = stored.model_copy(update={"timing": RunTiming(pending_started_at=now)})
+            else:
+                recovered = transition_run(stored, RunStatus.FAILED, occurred_at=now, error=error)
+            db.execute(
+                f"UPDATE {_T_RUNS} SET status=?, payload=? WHERE id=?",
+                (recovered.status, canonical_json(recovered), recovered.id),
+            )
+            projection.put_run(db, recovered)
+            return recovered
 
     def count_active_runs_by_api_key(self, api_key: str | None) -> int:
         with self._connect() as db:
