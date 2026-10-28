@@ -118,6 +118,7 @@
           env:
             AGENTGATE_DB: ${{ runner.temp }}/agentgate.db
             AGENTGATE_LOG_PATH: ${{ runner.temp }}/agentgate-logs
+            TERM: dumb
           run: |
             mkdir -p test-reports
             uv run --no-sync pytest tests \
