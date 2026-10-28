@@ -37,8 +37,6 @@
       env:
         AGENT_TASK_DISPATCHER_TYPE: celery
         AGENTGATE_DB_TYPE: sqlite
-        AGENTGATE_DB: ${{ runner.temp }}/agentgate.db
-        AGENTGATE_LOG_PATH: ${{ runner.temp }}/agentgate-logs
 
         AGENTGATE_REDIS_MODE: single
         AGENTGATE_REDIS_URL: redis://127.0.0.1:6379/0
@@ -114,9 +112,12 @@
               --host=127.0.0.1 \
               --port=3306 \
               --user=agentgate_ci \
-              eric_agentgate_test < scripts/init.sql
+              eric_agentgate_test < scripts/sql/init.sql
 
         - name: Run complete backend suite
+          env:
+            AGENTGATE_DB: ${{ runner.temp }}/agentgate.db
+            AGENTGATE_LOG_PATH: ${{ runner.temp }}/agentgate-logs
           run: |
             mkdir -p test-reports
             uv run --no-sync pytest tests \
