@@ -69,6 +69,8 @@ createApp({ setup() {
     h('h1', 'Sample editor acceptance'),
     h('button', { onClick: () => auth.loginBank('sample-test-token', 'team-test', '测试团队') }, 'Switch to bank'),
     h('button', { onClick: () => auth.loginExternal() }, 'Switch to external'),
+    h('button', { onClick: () => auth.initializePlatform({ token: 'sample-integrated-token', teamId: 'integrated-team',
+      teamName: '集成测试团队', userId: 'integrated-user', userName: '集成用户' }) }, 'Switch to integrated'),
     h('span', { 'data-testid': 'dirty' }, String(dirty.value)),
     h('p', { role: 'alert' }, error.value),
     h('button', { onClick: load }, 'Reload server sample'),
@@ -466,33 +468,46 @@ test('workflow initialization keeps text and JSON value types after save and rel
   expect((await save(page, datasetId)).initial_state.config_variables).toEqual(variables);
 });
 
-test('only workflow initialization is shown and hidden imported state survives manual edits', async ({ page }) => {
+test('saved base initialization is editable without selecting an agent and retains historical input variables and tool state', async ({ page }) => {
   const datasetId = await open(page, 'state');
   const original = sample('state');
   const initial = { ...original.initial_state,
-    prompt_variables: [{ name: 'prompt', value: 'retained' }],
+    prompt_variables: [{ name: 'prompt', value: 'retained', type: 'str' },
+      { name: 'user_input', value: 'historical input', type: 'str' },
+      { name: 'BOT_USER_INPUT', value: 'historical bot input', type: 'str' }],
     tool_variables: [{ name: 'tool', value: { enabled: false }, type: 'custom' }] };
+  const turns = [...original.turns,
+    { id: 'base-second-turn', input: { user_input: 'second turn', form: { approved: false } }, expectations: [] }];
   const seeded = await page.request.put(baseUrl + `/api/datasets/${datasetId}/drafts/cases/${original.id}`, {
-    data: { ...original, initial_state: initial },
+    data: { ...original, initial_state: initial, turns },
   });
   expect(seeded.ok()).toBeTruthy();
   await page.reload();
   await expandInitialization(page);
-  const types = page.getByRole('group', { name: '初始化类型', exact: true });
-  await expect(types.getByRole('button')).toHaveCount(1);
-  await expect(types.getByRole('button', { name: '工作流', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByRole('group', { name: '初始化类型', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '工作流', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '基础编排', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '自动获取变量', exact: true })).toBeDisabled();
+  await expect(page.getByLabel(/^初始化变量名 \d+$/)).toHaveCount(3);
+  await expect(page.getByLabel('初始化变量名 1', { exact: true })).toHaveValue('prompt');
+  await expect(page.getByLabel('初始化变量值 1', { exact: true })).toHaveValue('retained');
+  await expect(page.getByLabel('初始化变量名 2', { exact: true })).toHaveValue('user_input');
+  await expect(page.getByLabel('初始化变量名 3', { exact: true })).toHaveValue('BOT_USER_INPUT');
+  await page.getByLabel('初始化变量值 1', { exact: true }).fill('edited prompt');
   await addInitializationVariable(page, 'centreId', '810000');
-  expect((await save(page, datasetId)).initial_state).toEqual({ ...initial,
-    config_variables: [{ name: 'centreId', value: '810000', type: 'str' }] });
+  const saved = await save(page, datasetId);
+  const expected = { ...initial, prompt_variables: [
+    { ...initial.prompt_variables[0], value: 'edited prompt' }, ...initial.prompt_variables.slice(1),
+    { name: 'centreId', value: '810000', type: 'str' },
+  ] };
+  expect(saved.initial_state).toEqual(expected);
+  expect(saved.turns.map((turn: any) => turn.input)).toEqual(turns.map(turn => turn.input));
+  await page.reload();
   await expandInitialization(page);
-  await page.getByLabel('初始化变量名 1', { exact: true }).fill('userId');
-  await page.getByLabel('初始化变量值 1', { exact: true }).fill('user-1');
-  expect((await save(page, datasetId)).initial_state).toEqual({ ...initial,
-    config_variables: [{ name: 'userId', value: 'user-1', type: 'str' }] });
-  await expandInitialization(page);
-  await page.getByRole('button', { name: '删除初始化变量 1', exact: true }).click();
-  expect((await save(page, datasetId)).initial_state).toEqual(initial);
+  await expect(page.getByLabel('初始化变量值 1', { exact: true })).toHaveValue('edited prompt');
+  await expect(page.getByLabel('初始化变量值 2', { exact: true })).toHaveValue('historical input');
+  await page.getByLabel('样本名称', { exact: true }).fill('Re-saved base initialization');
+  expect((await save(page, datasetId)).initial_state).toEqual(expected);
 });
 
 test('malformed workflow variables stay editable and block saving until repaired', async ({ page }) => {
@@ -569,6 +584,19 @@ function workflowConfig(variables = workflowVariables) {
     ] },
   } };
 }
+const baseVariables = [
+  { key: 'userId', type: 'string', required: true },
+  { key: 'workspace', type: 'string', required: false,
+    default: 'do-not-initialize-from-default', scope: 'session', readonly: true },
+  { key: 'user_input', type: 'string', required: true },
+  { key: 'BOT_USER_INPUT', type: 'string', required: true },
+];
+function baseConfig() {
+  return { code: '0', message: 'success', data: {
+    agent_id: 'base-test', agent_type: 'tool_agent', agent_version: '1',
+    agent_config: { prompt_variables: baseVariables },
+  } };
+}
 async function mockVariableDirectory(page: Page, config: (route: Route) => Promise<void>) {
   const calls: { origin: string; path: string; token: string | undefined;
     team: string | null; agent: string | null; version: string | null }[] = [];
@@ -581,8 +609,9 @@ async function mockVariableDirectory(page: Page, config: (route: Route) => Promi
     if (url.pathname === '/web/agent/agents') {
       await route.fulfill({ json: { records: [
         { id: 'workflow-test', name: '测试工作流', agentType: 'workflow' },
+        { id: 'base-test', name: '测试基础编排', agentType: 'base' },
         { id: 'claw-test', name: '测试分支智能体', agentType: 'abcclaw' },
-      ], total: 2, size: 1000, current: 1, pages: 1 } });
+      ], total: 3, size: 1000, current: 1, pages: 1 } });
     } else if (url.pathname === '/web/agent/getAgentVersionList') {
       await route.fulfill({ json: { code: '0', message: '', data: [
         { agentVersion: variableVersion, updatedAt: variableVersion },
@@ -605,6 +634,159 @@ async function selectVariableWorkflow(page: Page | Locator) {
   await chooseVariableAgent(page, '选择智能体', '测试工作流');
   await chooseVariableAgent(page, '智能体版本', variableVersion);
 }
+async function selectVariableBase(page: Page | Locator) {
+  await expandInitialization(page);
+  await chooseVariableAgent(page, '选择智能体', '测试基础编排');
+  await chooseVariableAgent(page, '智能体版本', variableVersion);
+}
+
+for (const mode of ['external', 'bank', 'integrated'] as const) {
+  test(`${mode} fetches base variables with matching credentials and saves prompt values without forwarding required metadata`, async ({ page }) => {
+    const calls = await mockVariableDirectory(page, route => route.fulfill({ json: baseConfig() }));
+    const datasetId = await open(page, 'state');
+    if (mode !== 'external') await page.getByRole('button', { name: `Switch to ${mode}`, exact: true }).click();
+    await selectVariableBase(page);
+    await expect(page.getByRole('group', { name: '初始化类型', exact: true })).toHaveCount(0);
+    await addInitializationVariable(page, 'userId', 'kept-user');
+    await page.getByRole('button', { name: '自动获取变量', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: '已获取 2 个初始化变量' })).toBeVisible();
+    expect(await page.getByLabel(/^初始化变量名 \d+$/).evaluateAll(inputs =>
+      inputs.map(input => (input as HTMLInputElement).value))).toEqual(['userId', 'workspace']);
+    await expect(page.getByLabel('初始化变量值 1', { exact: true })).toHaveValue('kept-user');
+    await expect(page.getByLabel('初始化变量类型 1', { exact: true })).toHaveText('str');
+    await expect(page.getByLabel('初始化变量是否必填 1', { exact: true })).toHaveText('是');
+    await expect(page.getByLabel('初始化变量是否必填 2', { exact: true })).toHaveText('否');
+    await expect(page.getByLabel('初始化变量值 2', { exact: true })).toHaveValue('');
+    await expect(page.getByLabel('初始化变量值 2', { exact: true })).toBeEnabled();
+    await page.getByLabel('初始化变量值 2', { exact: true }).fill('customer-workspace');
+    const saved = await save(page, datasetId);
+    const expected = { ...sample('state').initial_state, prompt_variables: [
+      { name: 'userId', value: 'kept-user', type: 'str' },
+      { name: 'workspace', value: 'customer-workspace', type: 'str' },
+    ] };
+    expect(saved.initial_state).toEqual(expected);
+    expect(saved.turns.map((turn: any) => turn.input)).toEqual(sample('state').turns.map(turn => turn.input));
+    expect(calls.map(call => call.path)).toEqual(['/web/agent/agents', '/web/agent/getAgentVersionList', configPath]);
+    expect(calls.filter(call => call.path === configPath)).toMatchObject([
+      { agent: 'base-test', version: variableVersion },
+    ]);
+    expect(calls.every(call => call.origin === (mode === 'external' ? 'http://127.0.0.1:8119' : 'http://bank.invalid'))).toBeTruthy();
+    const token = { external: 'local', bank: 'sample-test-token', integrated: 'sample-integrated-token' }[mode];
+    expect(calls.every(call => call.token === `Bearer ${token}`)).toBeTruthy();
+    expect(calls[0].team).toBe({ external: null, bank: 'team-test', integrated: 'integrated-team' }[mode]);
+    await page.reload();
+    await expandInitialization(page);
+    await expect(page.getByLabel('初始化变量值 1', { exact: true })).toHaveValue('kept-user');
+    await expect(page.getByLabel('初始化变量值 2', { exact: true })).toHaveValue('customer-workspace');
+    await expect(page.getByLabel('初始化变量是否必填 1', { exact: true })).toHaveText('-');
+    await page.getByLabel('样本名称', { exact: true }).fill('Saved base variables');
+    expect((await save(page, datasetId)).initial_state).toEqual(expected);
+  });
+}
+
+test('an empty sample can manually save base initialization after selecting its agent without fetching', async ({ page }) => {
+  const calls = await mockVariableDirectory(page, route => route.fulfill({ json: baseConfig() }));
+  const datasetId = await open(page);
+  await selectVariableBase(page);
+  await addInitializationVariable(page, 'user_input', 'manual initialization input');
+  await page.getByLabel('用户输入', { exact: true }).fill('independent turn input');
+  const saved = await save(page, datasetId, 'POST');
+  expect(saved.initial_state).toEqual({ prompt_variables: [
+    { name: 'user_input', value: 'manual initialization input', type: 'str' },
+  ] });
+  expect(saved.turns[0].input).toEqual({ txt: 'independent turn input' });
+  expect(calls.filter(call => call.path === configPath)).toEqual([]);
+});
+
+test('successful base and workflow fetches replace the initialization format while retaining shared values and unrelated data', async ({ page }) => {
+  await mockVariableDirectory(page, route => route.fulfill({ json:
+    new URL(route.request().url()).searchParams.get('agentId') === 'base-test'
+      ? baseConfig() : workflowConfig([{ name: 'userId', type: 'str', required: true }]),
+  }));
+  const datasetId = await open(page, 'state');
+  const original = sample('state');
+  const initial = { ...original.initial_state,
+    config_variables: [{ name: 'userId', value: 'shared-user', type: 'str', required: true },
+      { name: 'workflowOnly', value: 'previous workflow value', type: 'str' }],
+    tool_variables: [{ name: 'lookup', value: { enabled: false }, type: 'custom' }],
+  };
+  const turns = [...original.turns,
+    { id: 'format-second-turn', input: { user_input: 'second turn', menuId: 'ACCOUNT' }, expectations: [] }];
+  expect((await page.request.put(baseUrl + `/api/datasets/${datasetId}/drafts/cases/${original.id}`, {
+    data: { ...original, initial_state: initial, turns },
+  })).ok()).toBeTruthy();
+  await page.reload();
+  await selectVariableBase(page);
+  await expect(page.getByLabel('初始化变量名 2', { exact: true })).toHaveValue('workflowOnly');
+  const fetchButton = page.getByRole('button', { name: '自动获取变量', exact: true });
+  await fetchButton.click();
+  await expect(page.getByRole('status').filter({ hasText: '已获取 2 个初始化变量' })).toBeVisible();
+  await page.getByLabel('初始化变量值 2', { exact: true }).fill('base-workspace');
+  const baseSaved = await save(page, datasetId);
+  expect(baseSaved.initial_state).toEqual({ ...original.initial_state, tool_variables: initial.tool_variables,
+    prompt_variables: [{ name: 'userId', value: 'shared-user', type: 'str' },
+      { name: 'workspace', value: 'base-workspace', type: 'str' }] });
+  expect(baseSaved.turns.map((turn: any) => turn.input)).toEqual(turns.map(turn => turn.input));
+  await selectVariableWorkflow(page);
+  await expect(page.getByLabel('初始化变量名 2', { exact: true })).toHaveValue('workspace');
+  await fetchButton.click();
+  await expect(page.getByRole('status').filter({ hasText: '已获取 1 个初始化变量' })).toBeVisible();
+  const workflowSaved = await save(page, datasetId);
+  expect(workflowSaved.initial_state).toEqual({ ...original.initial_state, tool_variables: initial.tool_variables,
+    config_variables: [{ name: 'userId', value: 'shared-user', type: 'str', required: true }] });
+  expect(workflowSaved.turns.map((turn: any) => turn.input)).toEqual(turns.map(turn => turn.input));
+});
+
+for (const target of ['base', 'workflow'] as const) {
+  test(`failed ${target} fetch retains the saved initialization format and values`, async ({ page }) => {
+    await mockVariableDirectory(page, route => route.fulfill({ status: 503, json: {} }));
+    const datasetId = await open(page, 'state');
+    const original = sample('state');
+    const field = target === 'base' ? 'config_variables' : 'prompt_variables';
+    const initial = { ...original.initial_state,
+      [field]: [{ name: 'userId', value: 'saved-user', type: 'str' }],
+      tool_variables: [{ name: 'tool', value: [0, false], type: 'custom' }],
+    };
+    expect((await page.request.put(baseUrl + `/api/datasets/${datasetId}/drafts/cases/${original.id}`, {
+      data: { ...original, initial_state: initial },
+    })).ok()).toBeTruthy();
+    await page.reload();
+    await (target === 'base' ? selectVariableBase(page) : selectVariableWorkflow(page));
+    await page.getByLabel('初始化变量值 1', { exact: true }).fill('retained-edit');
+    await page.getByRole('button', { name: '自动获取变量', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: '获取变量失败' })).toBeVisible();
+    await expect(page.getByLabel('初始化变量值 1', { exact: true })).toHaveValue('retained-edit');
+    const saved = await save(page, datasetId);
+    expect(saved.initial_state).toEqual({ ...initial,
+      [field]: [{ name: 'userId', value: 'retained-edit', type: 'str' }] });
+    expect(saved.turns[0].input).toEqual(original.turns[0].input);
+  });
+}
+
+test('a late base response cannot replace workflow variables after selecting another agent', async ({ page }) => {
+  let release!: () => void;
+  let arrived!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const requested = new Promise<void>(resolve => { arrived = resolve; });
+  await mockVariableDirectory(page, async route => {
+    arrived();
+    await pending;
+    await route.fulfill({ json: baseConfig() });
+  });
+  const datasetId = await open(page, 'state');
+  await addInitializationVariable(page, 'userId', 'workflow-value');
+  await selectVariableBase(page);
+  await page.getByRole('button', { name: '自动获取变量', exact: true }).click();
+  await requested;
+  await selectVariableWorkflow(page);
+  const response = page.waitForResponse(response => new URL(response.url()).pathname === configPath);
+  release();
+  await response;
+  await expect(page.getByRole('status').filter({ hasText: '已获取' })).toHaveCount(0);
+  await expect(page.getByLabel(/^初始化变量名 \d+$/)).toHaveCount(1);
+  expect((await save(page, datasetId)).initial_state).toEqual({ ...sample('state').initial_state,
+    config_variables: [{ name: 'userId', value: 'workflow-value', type: 'str' }] });
+});
 
 for (const mode of ['external', 'bank'] as const) {
   test(`${mode} fetches workflow variables with matching credentials and preserves file variable values through refresh and publication`, async ({ page }) => {
