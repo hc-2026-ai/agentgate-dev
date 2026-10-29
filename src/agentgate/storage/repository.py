@@ -227,6 +227,11 @@ class AgentGateRepository(Protocol):
     def claim_waiting_run(
         self, run_id: str, claimed_at: datetime
     ) -> EvaluationRun | None: ...
+    def recover_run(
+        self, expected: EvaluationRun, *, now: datetime, error: str | None = None
+    ) -> EvaluationRun | None:
+        """Initialize a legacy pending clock or fail an unchanged active run atomically."""
+        ...
     def count_active_runs_by_api_key(
         self, api_key: str | None
     ) -> int: ...

@@ -149,6 +149,7 @@ def dispatch_due_evaluation_runs() -> int:
     dispatcher = create_dispatcher()
     with closing(create_repository(load_database_config())) as repository:
         scheduling = RunScheduling(repository)
+        scheduling.recover_stale_runs(dispatcher)
         due = scheduling.dispatch_due_runs(dispatcher)
         waiting = scheduling.dispatch_waiting_runs(dispatcher)
         return len(due) + len(waiting)

@@ -144,6 +144,17 @@ class RunManifest(DomainModel):
         return tuple(cases_by_id[case_id] for case_id in self.selected_case_ids)
 
 
+class RunTiming(DomainModel):
+    """Execution timestamps independent of the immutable manifest."""
+
+    pending_started_at: datetime | None = None
+
+    @field_validator("pending_started_at")
+    @classmethod
+    def normalize_pending_time(cls, value: datetime | None) -> datetime | None:
+        return normalize_utc(value, "pending_started_at") if value is not None else None
+
+
 class EvaluationRun(DomainModel):
     """Lifecycle record for one complete Dataset evaluation."""
 
@@ -155,6 +166,7 @@ class EvaluationRun(DomainModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     error: str | None = None
+    timing: RunTiming = Field(default_factory=RunTiming)
     user_team_id: str = ""  # 团队 ID（权限隔离，按团队过滤数据可见性）
     user_id: str = ""  # 用户 ID（创建者标识）
     user_name: str = ""  # 用户姓名（创建者显示名）
@@ -249,6 +261,7 @@ def transition_run(
     if new_status == RunStatus.WAITING:
         pass
     elif new_status == RunStatus.PENDING:
+        updates["timing"] = RunTiming(pending_started_at=timestamp)
         if run.status == RunStatus.SCHEDULED and (
             run.scheduled_for is None or timestamp < run.scheduled_for
         ):

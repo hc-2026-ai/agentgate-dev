@@ -43,6 +43,7 @@ from agentgate.domain import (
 )
 from agentgate.domain.credential import ApiKeyMetadata
 from agentgate.domain.evaluation_task import EvaluationTask, task_with_rerun
+from agentgate.domain.run import RunTiming
 from agentgate.evaluator.versioning import publish_evaluator_draft as build_publication
 from agentgate.storage import mysql_schema as s
 from agentgate.storage.configuration import TDSQLConfig
@@ -1052,6 +1053,24 @@ class MySQLRepository:
             for run in _models(db, s.runs, EvaluationRun, user_team_id=user_team_id):
                 counts[run.status] += 1
         return counts
+
+    def recover_run(
+        self, expected: EvaluationRun, *, now: datetime, error: str | None = None
+    ) -> EvaluationRun | None:
+        now = normalize_utc(now, "Run recovery time")
+        with self._transaction() as db:
+            stored = _one(db, s.runs, EvaluationRun, id=expected.id, lock=True)
+            if stored != expected or stored.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
+                return None
+            if error is None:
+                if stored.status is not RunStatus.PENDING or stored.timing.pending_started_at is not None:
+                    return None
+                recovered = stored.model_copy(update={"timing": RunTiming(pending_started_at=now)})
+            else:
+                recovered = transition_run(stored, RunStatus.FAILED, occurred_at=now, error=error)
+            _update(db, s.runs, recovered)
+            projection.put_run(db, recovered)
+            return recovered
 
     def count_active_runs_by_api_key(self, api_key: str | None) -> int:
         with self._transaction() as db:

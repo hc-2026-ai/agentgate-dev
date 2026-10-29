@@ -140,7 +140,7 @@ def create_ab_runs(
         "timeout_seconds": timeout_seconds,
     }
     baseline_run = run_management.create_run(baseline_target, persist=False, **run_arguments)
-    candidate_run = EvaluationRun(manifest=type(baseline_run.manifest).model_validate({
+    candidate_run = EvaluationRun(timing=baseline_run.timing, manifest=type(baseline_run.manifest).model_validate({
         **baseline_run.manifest.model_dump(exclude={"manifest_sha256"}), "target": candidate_target,
     }))
     from agentgate.domain.evaluation_task import EvaluationTask

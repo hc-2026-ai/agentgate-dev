@@ -45,6 +45,7 @@ def main() -> int:
     while not stopped.is_set():
         with closing(create_repository(config)) as repository:
             scheduling = RunScheduling(repository)
+            scheduling.recover_stale_runs(dispatcher)
             due = scheduling.dispatch_due_runs(dispatcher)
             waiting = scheduling.dispatch_waiting_runs(dispatcher)
         total = len(due) + len(waiting)
