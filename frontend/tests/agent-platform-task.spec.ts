@@ -7,11 +7,11 @@ let server: ViteDevServer;
 let url: string;
 const fixture = `<!doctype html><html><body><div id="app"></div><script type="module">
 import {createApp,h,ref} from 'vue';
-import {agentDirectory} from '/src/api/agent-platform.ts';
+import {agentDirectory,localAgentDirectory} from '/src/api/agent-platform.ts';
 import Picker from '/src/views/evaluation/components/AgentTargetPicker.vue';
 import '/node_modules/element-plus/dist/index.css';
 window.directory=agentDirectory;
-window.callDirectory=async(name,input)=>{try{return {ok:true,value:await agentDirectory[name](input)}}catch(error){return {ok:false,error:{status:error.status,kind:error.kind,message:error.message,properties:Object.keys(error),cause:error.cause}}}};
+window.callDirectory=async(name,input,mode='bank')=>{const directory=mode==='external'?localAgentDirectory:agentDirectory;try{return {ok:true,value:await directory[name](input)}}catch(error){return {ok:false,error:{status:error.status,kind:error.kind,message:error.message,properties:Object.keys(error),cause:error.cause}}}};
 createApp({setup(){const picker=ref(null),token=ref('test-token'),teamId=ref('a');window.readTarget=()=>picker.value?.readSubmissionSelection();window.setAuth=auth=>{token.value=auth.token;teamId.value=auth.teamId;};return()=>h(Picker,{ref:picker,directory:agentDirectory,token:token.value,teamId:teamId.value});}}).mount('#app');
 </script></body></html>`;
 
@@ -104,8 +104,12 @@ const batch = (records: unknown[], total = records.length, current = 1, size = 3
 });
 const reply = (route: Route, value: unknown, status = 200) =>
   route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) });
-const call = (page: Page, name: string, input: Record<string, unknown> = { token: 'test-token' }) =>
-  page.evaluate(({ name, input }) => (window as any).callDirectory(name, input), { name, input });
+const call = (
+  page: Page,
+  name: string,
+  input: Record<string, unknown> = { token: 'test-token' },
+  mode: 'bank' | 'external' = 'bank',
+) => page.evaluate(({ name, input, mode }) => (window as any).callDirectory(name, input, mode), { name, input, mode });
 async function choose(page: Page, label: string, option: string) {
   await page.getByRole('combobox', { name: label, exact: true }).press('Enter');
   await page
@@ -332,6 +336,97 @@ test('in-bank base/workflow versions reject blank updatedAt even if agentVersion
   expect(await call(page, 'getAgentVersions', { token: 't', agentId: 'base-1' }))
     .toMatchObject({ ok: false, error: { kind: 'protocol', status: 200 } });
 });
+
+const initializationDefinitions = [
+  {
+    kind: 'base',
+    data: {
+      agent_type: 'tool_agent',
+      agent_config: {
+        prompt_variables: [
+          { key: 'customerId', name: '客户标识', type: 'string', required: true },
+          { key: 'displayName', name: 'user_input', type: 'string' },
+          { key: 'systemCode', name: 'BOT_USER_INPUT', type: 'string', scope: 'system', readonly: true },
+          { key: 'retryCount', name: '重试次数', type: 'number', value: 0 },
+          { key: 'enabled', name: '启用', type: 'boolean', default: false },
+          { key: 'optional' },
+          { key: 'User_Input', type: 'string' },
+          { key: 'BOT_USER_INPUT_EXTRA', type: 'str' },
+          { key: 'user_input', name: '输入问题', type: 'string' },
+          { key: 'BOT_USER_INPUT', name: '用户输入', type: 'string' },
+        ],
+        nodes: [{ type: 'Start', config: { variables: [{ name: 'ignoredWorkflowVariable' }] } }],
+      },
+    },
+    expected: [
+      { name: 'customerId', type: 'str', required: true },
+      { name: 'displayName', type: 'str', required: false },
+      { name: 'systemCode', type: 'str', required: false },
+      { name: 'retryCount', type: 'number', required: false },
+      { name: 'enabled', type: 'boolean', required: false },
+      { name: 'optional', type: 'str', required: false },
+      { name: 'User_Input', type: 'str', required: false },
+      { name: 'BOT_USER_INPUT_EXTRA', type: 'str', required: false },
+    ],
+  },
+  {
+    kind: 'workflow',
+    data: {
+      agent_type: 'workflow',
+      agent_config: {
+        prompt_variables: [{ key: 'ignoredBaseVariable' }],
+        nodes: [
+          { type: 'Task', config: { variables: [{ name: 'ignoredTaskVariable' }] } },
+          { type: 'Start', config: { variables: [
+            { name: 'customerId', key: 'ignoredKey', type: 'str', required: true },
+            { name: 'User_Input', type: 'string', scope: 'system', readonly: true, default: 0 },
+            { name: 'BOT_USER_INPUT_EXTRA', type: 'number', value: 0 },
+            { name: 'optional' },
+            { name: 'user_input', key: 'otherKey', type: 'str' },
+            { name: 'BOT_USER_INPUT', type: 'str' },
+          ] } },
+        ],
+      },
+    },
+    expected: [
+      { name: 'customerId', type: 'str', required: true },
+      { name: 'User_Input', type: 'string', required: false },
+      { name: 'BOT_USER_INPUT_EXTRA', type: 'number', required: false },
+      { name: 'optional', type: 'str', required: false },
+    ],
+  },
+];
+
+for (const mode of ['bank', 'external'] as const) {
+  for (const definition of initializationDefinitions) {
+    test(`${mode} ${definition.kind} initialization definitions preserve identifiers and use the config endpoint`, async ({ page }) => {
+      const requests: {
+        origin: string; path: string; query: Record<string, string>; authorization?: string;
+      }[] = [];
+      await page.route('**/web/agent/getAgentConfigJsonObjectByAgentIdAndVersion?**', async (route) => {
+        const parsed = new URL(route.request().url());
+        requests.push({
+          origin: parsed.origin,
+          path: parsed.pathname,
+          query: Object.fromEntries(parsed.searchParams),
+          authorization: (await route.request().allHeaders()).authorization,
+        });
+        await reply(route, wrap(definition.data));
+      });
+      const token = mode === 'external' ? 'local' : 'bank-initialization-token';
+      const agentId = `${definition.kind} &/+#?`;
+      expect(await call(page, 'getInitializationVariables', {
+        token, agentId, agentVersion: bankVersionOne,
+      }, mode)).toEqual({ ok: true, value: definition.expected });
+      expect(requests).toEqual([{
+        origin: mode === 'external' ? 'http://127.0.0.1:8119' : new URL(url).origin,
+        path: '/web/agent/getAgentConfigJsonObjectByAgentIdAndVersion',
+        query: { agentId, agentVersion: bankVersionOne },
+        authorization: `Bearer ${token}`,
+      }]);
+    });
+  }
+}
 
 test('a failed or inconsistent subsequent page never returns partial success', async ({ page }) => {
   for (const mode of ['http', 'repeated-page', 'changed-total', 'early-empty']) {

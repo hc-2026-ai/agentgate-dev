@@ -334,22 +334,25 @@ function normalizeInitializationVariables(
 ): PlatformInitializationVariable[] {
   const data = object(value, status);
   const config = object(data.agent_config, status);
-  return array(config.nodes ?? [], status).flatMap((raw) => {
-    const node = object(raw, status);
-    if (node.type !== 'Start') return [];
-    const start = object(node.config ?? {}, status);
-    return array(start.variables ?? [], status).flatMap((rawVariable) => {
-      const variable = object(rawVariable, status);
-      const name = text(variable.name, status);
-      if (name === 'BOT_USER_INPUT' || name === 'user_input') return [];
-      return [
-        {
-          name,
-          type: typeof variable.type === 'string' ? variable.type : 'str',
-          required: variable.required === true,
-        },
-      ];
-    });
+  const isBase = data.agent_type === 'tool_agent';
+  const variables = isBase
+    ? array(config.prompt_variables ?? [], status)
+    : array(config.nodes ?? [], status).flatMap((raw) => {
+        const node = object(raw, status);
+        if (node.type !== 'Start') return [];
+        const start = object(node.config ?? {}, status);
+        return array(start.variables ?? [], status);
+      });
+  return variables.flatMap((rawVariable) => {
+    const variable = object(rawVariable, status);
+    const name = text(isBase ? variable.key : variable.name, status);
+    if (name === 'BOT_USER_INPUT' || name === 'user_input') return [];
+    const type = typeof variable.type === 'string' ? variable.type : 'str';
+    return [{
+      name,
+      type: isBase && type === 'string' ? 'str' : type,
+      required: variable.required === true,
+    }];
   });
 }
 

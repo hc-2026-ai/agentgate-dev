@@ -28,9 +28,7 @@ const platformTeamId = computed(() => (auth.usesPlatformDirectory ? auth.teamId 
 const variableAgent = ref<AgentTargetSelection | null>(null);
 const variableFetchNotice = ref('');
 const fetchingVariables = ref(false);
-const isVariableWorkflow = computed(() =>
-  (variableAgent.value?.platformArrangeType || variableAgent.value?.platformAgentType) === 'workflow',
-);
+const selectedInitializationField = computed(() => initializationFieldForAgent(variableAgent.value));
 let variableFetchSequence = 0;
 watch(
   [
@@ -51,15 +49,23 @@ watch(
 onBeforeUnmount(() => variableFetchSequence++);
 function receiveVariableAgent(selection: AgentTargetSelection | null) {
   variableAgent.value = selection;
+  const field = initializationFieldForAgent(selection);
+  if (
+    field &&
+    !configVariables.value[initializationField.value].length &&
+    configVariablesRaw.value[initializationField.value] === null
+  )
+    initializationField.value = field;
 }
 async function requestVariables() {
   const selection = variableAgent.value;
+  const field = selectedInitializationField.value;
   const getVariables = platformDirectory.value.getInitializationVariables;
   if (
     !props.editable ||
     props.saving ||
     !selection ||
-    !isVariableWorkflow.value ||
+    !field ||
     fetchingVariables.value ||
     !getVariables
   )
@@ -74,21 +80,25 @@ async function requestVariables() {
       agentVersion: selection.agentVersion,
     });
     if (ticket !== variableFetchSequence) return;
-    const existing = configVariables.value.config_variables;
-    configVariables.value.config_variables = variables.map((variable) => {
+    const existing = configVariables.value[initializationField.value];
+    configVariables.value[field] = variables.map((variable) => {
       const previous = existing.find((row) => row.name === variable.name);
+      const extra: JsonObject = { type: variable.type };
+      if (field === 'config_variables') extra.required = variable.required;
       return {
         id: previous?.id ?? crypto.randomUUID(),
         name: variable.name,
         value: previous?.value ?? '',
         format: previous?.format ?? 'text',
-        extra: { type: variable.type, required: variable.required },
+        extra,
+        requiredHint: variable.required,
       };
     });
-    configVariablesRaw.value.config_variables = null;
+    configVariablesRaw.value[field] = null;
+    initializationField.value = field;
     variableFetchNotice.value = variables.length
       ? `已获取 ${variables.length} 个初始化变量，请填写变量值。`
-      : '该工作流没有初始化变量。';
+      : '该智能体没有初始化变量。';
   } catch (cause) {
     if (ticket !== variableFetchSequence) return;
     const status = (cause as { status?: number } | null)?.status;
@@ -116,17 +126,34 @@ type ConfigVariableRow = {
   value: string;
   format: 'text' | 'json';
   extra: JsonObject;
+  requiredHint?: boolean;
 };
-type InitializationField = 'config_variables';
-const initializationGroups: { key: InitializationField; label: string }[] = [
-  { key: 'config_variables', label: '初始化变量' },
-];
+type InitializationField = 'config_variables' | 'prompt_variables';
+const initializationField = ref<InitializationField>('config_variables');
+const initializationGroups = computed(() => [
+  { key: initializationField.value, label: '初始化变量' },
+]);
 const configVariables = ref<Record<InitializationField, ConfigVariableRow[]>>({
   config_variables: [],
+  prompt_variables: [],
 });
 const configVariablesRaw = ref<Record<InitializationField, string | null>>({
   config_variables: null,
+  prompt_variables: null,
 });
+function initializationFieldForAgent(selection: AgentTargetSelection | null): InitializationField | null {
+  const type = selection?.platformArrangeType || selection?.platformAgentType;
+  return type === 'base' ? 'prompt_variables' : type === 'workflow' ? 'config_variables' : null;
+}
+function initializationFieldForState(initial: JsonObject): InitializationField {
+  return 'config_variables' in initial || !('prompt_variables' in initial)
+    ? 'config_variables'
+    : 'prompt_variables';
+}
+function requiredHint(variable: ConfigVariableRow) {
+  const required = variable.requiredHint ?? variable.extra.required;
+  return typeof required === 'boolean' ? (required ? '是' : '否') : '-';
+}
 type OutputRule = Extract<Expectation, { kind: 'output' }>;
 const outputRules = ref<OutputRule[]>([]);
 const originalOutputs = ref<{ text: string; json: boolean }[]>([]);
@@ -163,6 +190,7 @@ function snapshot() {
     forbiddenTools.value,
     configVariables.value,
     configVariablesRaw.value,
+    initializationField.value,
   ]);
 }
 const dirty = computed(() => ruleDraftDirty.value || snapshot() !== baseline.value);
@@ -180,7 +208,9 @@ watch(
     forbiddenTools.value = item?.turns.map((t) => t.forbidden_tools.join('，')) ?? [];
     form.value = item ? JSON.parse(JSON.stringify(item)) : null;
     const initial = item?.initial_state ?? {};
+    initializationField.value = initializationFieldForState(initial);
     loadConfigVariables('config_variables', initial.config_variables);
+    loadConfigVariables('prompt_variables', initial.prompt_variables);
     index.value = 0;
     error.value = '';
     ruleDraftDirty.value = false;
@@ -332,7 +362,7 @@ function save() {
   }
   try {
     const item: EvaluationCase = JSON.parse(JSON.stringify(form.value));
-    for (const { key } of initializationGroups) {
+    for (const { key } of initializationGroups.value) {
       const variables =
         configVariablesRaw.value[key] !== null
           ? JSON.parse(configVariablesRaw.value[key]!)
@@ -374,6 +404,10 @@ function save() {
       if (variables.length) item.initial_state[key] = variables;
       else if (!Array.isArray(current) || current.length) delete item.initial_state[key];
     }
+    if (initializationField.value !== initializationFieldForState(form.value.initial_state))
+      delete item.initial_state[
+        initializationField.value === 'prompt_variables' ? 'config_variables' : 'prompt_variables'
+      ];
     item.turns.forEach((t, i) => {
       if (!inputs.value[i].trim()) throw Error('第 ' + (i + 1) + ' 轮用户输入不能为空');
       t.input = inputJson.value[i]
@@ -452,9 +486,6 @@ defineExpose({ save, fetchingVariables });
       </div>
       <details :key="form.id" class="case-initialization" aria-label="初始变量">
         <summary>初始变量</summary>
-        <div class="initialization-type" role="group" aria-label="初始化类型">
-          <button type="button" aria-pressed="true" :disabled="!editable">工作流</button>
-        </div>
         <div class="variable-agent-picker">
           <p>数据源：{{ auth.modeLabel }}</p>
           <AgentTargetPicker
@@ -471,14 +502,14 @@ defineExpose({ save, fetchingVariables });
               v-if="editable"
               class="add-variable fetch-variables"
               type="button"
-              :disabled="!isVariableWorkflow || fetchingVariables || saving"
+              :disabled="!selectedInitializationField || fetchingVariables || saving"
               :aria-busy="fetchingVariables"
               :title="
                 !variableAgent
                   ? '请先选择智能体及版本'
-                  : !isVariableWorkflow
-                    ? '当前仅支持获取工作流变量'
-                    : '获取所选工作流版本的初始化变量'
+                  : !selectedInitializationField
+                    ? '当前仅支持获取基础编排和工作流变量'
+                    : '获取所选智能体版本的初始化变量'
               "
               @click="requestVariables"
             >
@@ -495,9 +526,9 @@ defineExpose({ save, fetchingVariables });
             </button>
           </div>
           <p v-if="!variableAgent && !fetchingVariables">
-            请先选择工作流及版本，再点击“自动获取变量”。
+            请先选择智能体及版本，再点击“自动获取变量”。
           </p>
-          <p v-if="variableAgent && !isVariableWorkflow">当前仅支持自动获取工作流的初始化变量。</p>
+          <p v-if="variableAgent && !selectedInitializationField">当前仅支持自动获取基础编排和工作流的初始化变量。</p>
           <p v-if="variableFetchNotice" role="status">{{ variableFetchNotice }}</p>
           <template v-if="configVariablesRaw[group.key] !== null">
             <p class="initialization-warning">已有初始化配置格式不正确，请修正后保存。</p>
@@ -530,11 +561,7 @@ defineExpose({ save, fetchingVariables });
                 {{ variable.extra.type || '—' }}
               </span>
               <span class="variable-metadata" :aria-label="`${group.label}是否必填 ${i + 1}`">
-                {{
-                  typeof variable.extra.required === 'boolean'
-                    ? (variable.extra.required ? '是' : '否')
-                    : '-'
-                }}
+                {{ requiredHint(variable) }}
               </span>
               <div class="variable-value">
                 <textarea
