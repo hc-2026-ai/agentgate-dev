@@ -1498,6 +1498,7 @@ test('all three expectation kinds are created through the editor, reloaded and p
   const publication = page.waitForResponse(response => response.url().endsWith('/drafts/publish'));
   await page.getByRole('button', { name: 'Publish acceptance draft' }).click();
   expect((await publication).ok()).toBeTruthy();
+  await expect(page).toHaveURL(/(?:\?|&)published=1(?:&|$)/);
   await page.reload();
   for (let index = 0; index < 4; index++) {
     await expect(expectationInput(page, 'path', index)).toBeDisabled();
