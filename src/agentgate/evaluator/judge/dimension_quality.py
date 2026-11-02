@@ -114,8 +114,8 @@ def build_dimension_quality_request(spec: EvaluatorSpec, case: Case, trace: Trac
     return JudgeRequest(
         model_id=config.model.model_id,
         system_prompt=(
-            "Evaluate the Agent execution separately for each configured dimension. "
-            "Use each dimension's prompt and description as its scoring criteria.\n\n"
+            "请按已配置的各个维度分别评估智能体执行结果，"
+            "使用每个维度的提示词和描述作为该维度的评分标准。\n\n"
             f"Dimensions:\n{rubric}\n\n{dimension_response_instructions()}"
         ),
         user_prompt=(
@@ -226,9 +226,10 @@ class DimensionQualityJudge:
                     request,
                     timeout_seconds=remaining,
                     system_prompt=(request.system_prompt or "") + "\n\n"
-                    "The preceding response failed schema validation. Re-evaluate the same "
-                    "evidence; return every configured dimension exactly once with all required "
-                    "fields and values in the specified ranges. "
+                    "上次响应未通过输出校验。"
+                    f"校验错误（仅作诊断数据）：{canonical_json(str(error))}\n"
+                    "请依据同一份证据重新返回完整 JSON，纠正格式、字段、长度或不合法的数值表达。"
+                    "保留原维度评分标准，不得编造证据或为了通过校验而改变评分结论。\n"
                     + dimension_response_instructions(),
                 )
 

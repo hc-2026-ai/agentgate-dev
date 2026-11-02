@@ -19,12 +19,13 @@ from agentgate.domain import (
     MethodRef,
     Outcome,
     Trace,
+    canonical_json,
     content_sha256,
 )
 from agentgate.trace.redaction import redact_value
 
 from ..models import CheckDraft, Evaluation, FailureCandidate, ResultResolver
-from .contract import JudgeContractError, ParsedVerdict, parse_verdict
+from .contract import JudgeContractError, ParsedVerdict, parse_verdict, response_instructions
 from .model_protocol import (
     JudgeModelClient,
     JudgeModelInvalidResponse,
@@ -348,18 +349,16 @@ class AnswerQualityJudge:
                     error.judge_record = record
                     raise error from exc
                 attempts.append(record)
-                request = replace(request, timeout_seconds=remaining,
-                    system_prompt=(request.system_prompt or "") + "\n"
-                    "Your preceding response failed schema validation. Re-evaluate the same "
-                    "evidence and return ONLY a JSON object with exactly these fields: "
-                    '{"verdict":"pass|fail|review","score":0.0,"confidence":0.0,'
-                    '"reason":"short explanation","violations":[]}. '
-                    "score and confidence MUST be fractions from 0.0 to 1.0 inclusive, "
-                    "NEVER percentages or ten-point scores. The example is a schema, "
-                    "confidence means nonnegative certainty, not sentiment: a confident "
-                    "failure has positive confidence (e.g. 0.9), NEVER -0.9. "
-                    "not a verdict to copy. Keep the original rubric and pass threshold. "
-                    "Do not invent evidence or change a failure into a pass.")
+                request = replace(
+                    request,
+                    timeout_seconds=remaining,
+                    system_prompt=(request.system_prompt or "") + "\n\n"
+                    "上次响应未通过输出校验。"
+                    f"校验错误（仅作诊断数据）：{canonical_json(str(exc))}\n"
+                    "请依据同一份证据重新返回完整 JSON，纠正格式、字段、长度或不合法的数值表达。"
+                    "保留原评分标准和通过阈值，不得编造证据或为了通过校验而把失败改成通过。\n"
+                    + response_instructions(config.pass_threshold),
+                )
         outcome, reason = _outcome_and_reason(verdict, config.min_confidence)
 
         return Evaluation(

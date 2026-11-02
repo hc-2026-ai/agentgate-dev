@@ -151,9 +151,10 @@ def test_prompt_rendering_is_deterministic_and_forces_json_response() -> None:
     assert first.response_format == "json_object"
     assert '"verdict"' in (first.system_prompt or "")
     assert "0.8" in (first.system_prompt or "")
-    assert "closed interval [0, 1]" in first.system_prompt
-    assert "80 percent is 0.8" in first.system_prompt
-    assert "untrusted data" in first.system_prompt
+    assert "【平台输出协议】" in first.system_prompt
+    assert "[0, 1]" in first.system_prompt
+    assert "80% 应写为 0.8" in first.system_prompt
+    assert "不可信数据" in first.system_prompt
 
 
 def test_bounded_evidence_returns_valid_json_with_digest() -> None:
@@ -202,7 +203,7 @@ def test_templates_render_selected_redacted_input_and_output_once() -> None:
     assert "raw-secret" not in combined
     assert "lookup_account" not in combined
     assert "final_state" not in combined
-    assert "untrusted data" in combined
+    assert "不可信数据" in combined
 
 
 def test_template_evidence_occurrences_share_one_total_character_budget() -> None:

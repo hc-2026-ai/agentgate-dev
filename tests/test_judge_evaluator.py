@@ -15,6 +15,11 @@ from agentgate.domain import (
 )
 from agentgate.evaluator.executor import execute_evaluators
 from agentgate.evaluator.judge.answer_quality import AnswerQualityJudge
+from agentgate.evaluator.judge.contract import (
+    MAX_REASON_CHARS,
+    MAX_VIOLATION_DETAIL_CHARS,
+    response_instructions,
+)
 from agentgate.evaluator.judge.model_protocol import (
     JudgeModelTimeout,
     JudgeRequest,
@@ -418,33 +423,71 @@ def test_rejects_mismatched_client_provider_identity() -> None:
         AnswerQualityJudge({"different": model})
 
 
-def test_contract_correction_is_bounded_and_audited() -> None:
+INVALID_CONTRACT_RESPONSES = [
+    pytest.param(verdict_json(score=90), "'score' must be between 0 and 1", id="score-range"),
+    pytest.param("not JSON", "not valid JSON", id="invalid-json"),
+    pytest.param(
+        json.dumps({**json.loads(verdict_json()), "review": True}),
+        "unknown fields: review", id="extra-review-field",
+    ),
+    pytest.param(
+        verdict_json(reason="证" * (MAX_REASON_CHARS + 1)),
+        f"'reason' exceeds {MAX_REASON_CHARS} characters", id="reason-too-long",
+    ),
+    pytest.param(
+        json.dumps({
+            **json.loads(verdict_json()),
+            "violations": [{"criterion": "准确性", "detail": "x" * (MAX_VIOLATION_DETAIL_CHARS + 1)}],
+        }),
+        f"'violations[0].detail' exceeds {MAX_VIOLATION_DETAIL_CHARS} characters",
+        id="detail-too-long",
+    ),
+]
+
+
+@pytest.mark.parametrize("invalid_text,error_fragment", INVALID_CONTRACT_RESPONSES)
+def test_contract_correction_is_bounded_and_audited(invalid_text, error_fragment) -> None:
     class CorrectingModel(RecordingModel):
         def complete(self, request):
             self.requests.append(request)
-            return JudgeResponse(text=verdict_json(score=90) if len(self.requests) == 1
+            return JudgeResponse(text=invalid_text if len(self.requests) == 1
                                  else verdict_json(verdict="fail", score=0.2),
                                  resolved_model_id="resolved-model")
 
     model = CorrectingModel()
-    result = execute(model)
+    result = execute(model, spec=judge_spec(pass_threshold=0.85))
     assert result.outcome == Outcome.FAIL
     assert len(model.requests) == 2
     assert model.requests[1].timeout_seconds <= model.requests[0].timeout_seconds
+    first, correction = model.requests
+    assert correction.system_prompt.startswith(first.system_prompt)
+    assert first.user_prompt == correction.user_prompt
+    for request in model.requests:
+        assert "Judge answer quality." in request.system_prompt
+        assert response_instructions(0.85) in request.system_prompt
+    assert "上次响应未通过输出校验" in correction.system_prompt
+    assert error_fragment in correction.system_prompt
     assert result.judge_record.request_sha256 == request_fingerprint(model.requests[1])
     assert len(result.judge_record.previous_attempts) == 1
-    assert json.loads(result.judge_record.previous_attempts[0].raw_response)["score"] == 90
+    assert result.judge_record.previous_attempts[0].raw_response == invalid_text
     assert result.judge_record.previous_attempts[0].request_sha256 == request_fingerprint(model.requests[0])
 
 
-def test_repeated_invalid_contract_remains_error_with_both_responses() -> None:
-    model = RecordingModel(JudgeResponse(text=verdict_json(confidence=90),
+@pytest.mark.parametrize("invalid_text,error_fragment", INVALID_CONTRACT_RESPONSES)
+def test_repeated_invalid_contract_remains_error_with_both_responses(
+    invalid_text, error_fragment,
+) -> None:
+    model = RecordingModel(JudgeResponse(text=invalid_text,
                                         resolved_model_id="resolved-model"))
     result = execute(model)
     assert result.outcome == Outcome.ERROR
+    assert result.error_detail.category == "invalid_output"
+    assert error_fragment in result.error_detail.message
     assert len(model.requests) == 2
     assert result.score is None
     assert len(result.judge_record.previous_attempts) == 1
+    assert result.judge_record.raw_response == invalid_text
+    assert result.judge_record.previous_attempts[0].raw_response == invalid_text
 
 
 def test_annotation_evidence_prefers_actual_request_and_keeps_full_response():

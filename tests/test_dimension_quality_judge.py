@@ -24,6 +24,8 @@ from agentgate.domain import (
     Trace,
 )
 from agentgate.evaluator.executor import execute_evaluators
+from agentgate.evaluator.judge.contract import MAX_REASON_CHARS
+from agentgate.evaluator.judge.dimension_contract import dimension_response_instructions
 from agentgate.evaluator.judge.dimension_quality import (
     DimensionQualityJudge,
     build_dimension_quality_request,
@@ -227,11 +229,36 @@ def test_review_propagates_even_when_total_meets_threshold(review, min_confidenc
 
 
 @pytest.mark.parametrize(
-    "failure", ["missing", "duplicate", "unknown", "range", "boolean", "review_type", "extra"]
+    "failure", [
+        "missing", "duplicate", "unknown", "range", "boolean", "review_type", "extra",
+        "reason_length", "child_extra",
+        pytest.param(("id", "简洁性"), id="translated-id"),
+        pytest.param(("id", "CONCISE"), id="renamed-id"),
+        pytest.param(("score", "0.5"), id="score-string"),
+        pytest.param(("confidence", "0.9"), id="confidence-string"),
+        pytest.param(("review", "是"), id="review-chinese-yes"),
+        pytest.param(("review", "否"), id="review-chinese-no"),
+        pytest.param(("review", 0), id="review-zero"),
+        pytest.param(("review", 1), id="review-one"),
+        *[
+            pytest.param((field, None), id=f"null-{field}")
+            for field in ("id", "score", "confidence", "reason", "review")
+        ],
+        *[
+            pytest.param(("missing_field", field), id=f"missing-{field}")
+            for field in ("id", "score", "confidence", "reason", "review")
+        ],
+    ]
 )
 def test_invalid_response_cannot_be_success_and_records_both_attempts(failure):
     payload = response_data()
-    if failure == "missing":
+    if isinstance(failure, tuple):
+        field, value = failure
+        if field == "missing_field":
+            payload["dimensions"][0].pop(value)
+        else:
+            payload["dimensions"][0][field] = value
+    elif failure == "missing":
         payload["dimensions"].pop()
     elif failure == "duplicate":
         payload["dimensions"][0]["id"] = "correct"
@@ -243,6 +270,10 @@ def test_invalid_response_cannot_be_success_and_records_both_attempts(failure):
         payload["dimensions"][0]["score"] = True
     elif failure == "review_type":
         payload["dimensions"][0]["review"] = "false"
+    elif failure == "reason_length":
+        payload["dimensions"][0]["reason"] = "证" * (MAX_REASON_CHARS + 1)
+    elif failure == "child_extra":
+        payload["dimensions"][0]["analysis"] = "extra"
     else:
         payload["score"] = 1
     model = RecordingModel(payload)
@@ -256,13 +287,36 @@ def test_invalid_response_cannot_be_success_and_records_both_attempts(failure):
     assert json.loads(result.judge_record.previous_attempts[0].raw_response) == payload
 
 
-def test_one_correction_can_succeed_and_retains_the_failed_response():
-    model = RecordingModel({"dimensions": []}, response_data())
+@pytest.mark.parametrize("failure", ["missing", "reason_length", "invalid_json"])
+def test_one_correction_can_succeed_and_retains_the_failed_response(failure):
+    if failure == "invalid_json":
+        invalid_text = "not JSON"
+        error_fragment = "not valid JSON"
+    elif failure == "reason_length":
+        payload = response_data()
+        payload["dimensions"][0]["reason"] = "证" * (MAX_REASON_CHARS + 1)
+        invalid_text = json.dumps(payload)
+        error_fragment = "reason"
+    else:
+        invalid_text = json.dumps({"dimensions": []})
+        error_fragment = "cover every configured dimension"
+    model = RecordingModel(
+        JudgeResponse(text=invalid_text, resolved_model_id="judge"), response_data(),
+    )
     result = execute(model)
     assert result.outcome == Outcome.PASS
+    assert len(model.requests) == 2
     assert len(result.judge_record.previous_attempts) == 1
+    assert result.judge_record.previous_attempts[0].raw_response == invalid_text
     assert model.requests[1].timeout_seconds <= model.requests[0].timeout_seconds
-    assert "failed schema validation" in model.requests[1].system_prompt
+    first, correction = model.requests
+    assert correction.system_prompt.startswith(first.system_prompt)
+    assert correction.user_prompt == first.user_prompt
+    for request in model.requests:
+        assert dimension_response_instructions() in request.system_prompt
+        assert "检查事实" in request.system_prompt
+    assert "上次响应未通过输出校验" in correction.system_prompt
+    assert error_fragment in correction.system_prompt
 
 
 @pytest.mark.parametrize("first_response", [True, False])
@@ -331,6 +385,18 @@ def test_prompt_uses_actual_dimension_instructions_and_redacted_evidence():
     request = build_dimension_quality_request(spec(configuration), case(), execution_trace)
     assert "Context supplied to model" in request.system_prompt
     assert "检查事实" in request.system_prompt
+    assert "【平台输出协议】" in request.system_prompt
+    assert "顶层必须且只能包含 dimensions" in request.system_prompt
+    assert "不得翻译、改写或替换为维度名称" in request.system_prompt
+    assert "reason 必须为非空字符串，必须使用简体中文" in request.system_prompt
+    assert "工具名、代码、标识及必要的原文引用保留原样" in request.system_prompt
+    assert "JSON 字段名和固定枚举值保持英文，不得翻译" in request.system_prompt
+    assert "硬性上限为 600 字符" in request.system_prompt
+    assert "建议不超过 300 字符" in request.system_prompt
+    assert "完整响应文本建议不超过 32000 字符" in request.system_prompt
+    assert "维度较多时可超过建议值" in request.system_prompt
+    assert '"verdict":' not in request.system_prompt
+    assert '"violations":' not in request.system_prompt
     assert "hello" in request.user_prompt
     assert "secret" not in request.user_prompt
 
