@@ -366,6 +366,7 @@ class YunxiaSettings:
     debug_sse_failures: bool = False
     total_timeout_seconds: float = 0.0
     trace_settings: InbankTraceSettings = field(default_factory=InbankTraceSettings)
+    post_health_sleep_seconds: float = 15.0
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -391,6 +392,8 @@ class YunxiaSettings:
                 raise ValueError(f"{field_name} must be greater than zero")
         if not isinstance(self.trace_settings, InbankTraceSettings):
             raise TypeError("trace_settings must be InbankTraceSettings")
+        if not math.isfinite(self.post_health_sleep_seconds) or self.post_health_sleep_seconds < 0:
+            raise ValueError("post_health_sleep_seconds must be finite and nonnegative")
 
 
 class InbankYunxiaTargetAdapter:
@@ -631,6 +634,19 @@ class InbankYunxiaTargetAdapter:
             raise
         self._pod_lifecycle["health"] = "succeeded"
         self._log_pod_lifecycle("health", "succeeded")
+        delay = self.settings.post_health_sleep_seconds
+        if delay > 0:
+            LOGGER.info(
+                "inbank_post_health_sleep adapter=yunxia run_id=%r pod_name=%r "
+                "seconds=%s status=started",
+                self._run_id, self._pod_name, delay,
+            )
+            self._sleep(delay)
+            LOGGER.info(
+                "inbank_post_health_sleep adapter=yunxia run_id=%r pod_name=%r "
+                "seconds=%s status=completed",
+                self._run_id, self._pod_name, delay,
+            )
 
     def _wait_until_healthy(self) -> None:
         assert self._agent_name is not None
@@ -1054,6 +1070,9 @@ def load_yunxia_settings(
         health_wait_seconds=_positive_float(values, "AGENTGATE_INBANK_HEALTH_WAIT_SECONDS", 300.0),
         health_poll_interval_seconds=_positive_float(
             values, "AGENTGATE_INBANK_HEALTH_POLL_INTERVAL_SECONDS", 5.0
+        ),
+        post_health_sleep_seconds=float(
+            values.get("AGENTGATE_INBANK_YUNXIA_POST_HEALTH_SLEEP_SECONDS", "15")
         ),
         debug_sse_failures=_environment_flag(values, "AGENTGATE_INBANK_DEBUG_SSE_FAILURES"),
     )

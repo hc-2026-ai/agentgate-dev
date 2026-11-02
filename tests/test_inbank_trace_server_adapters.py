@@ -269,7 +269,7 @@ def _adapter(
     }
     if arrange_type == "yunxia":
         return InbankYunxiaTargetAdapter(
-            YunxiaSettings(**settings, agent_namespace="chatabc"),
+            YunxiaSettings(**settings, agent_namespace="chatabc", post_health_sleep_seconds=0),
             http=transport,
             trace_client=trace_server,
             **options,
@@ -1660,6 +1660,7 @@ def _trace_wait_settings(arrange_type, value=None, *, trace_environment=None):
         f"AGENTGATE_INBANK_{prefix}_DELETE_BASE_URL": "https://bank.test",
         "AGENTGATE_INBANK_YUNXIA_AGENT_NAMESPACE": "chatabc",
         "AGENTGATE_INBANK_REQUEST_TIMEOUT_SECONDS": "600",
+        "AGENTGATE_INBANK_YUNXIA_POST_HEALTH_SLEEP_SECONDS": "0",
     }
     if value is not None:
         environ["AGENTGATE_INBANK_TRACE_WAIT_SECONDS"] = value

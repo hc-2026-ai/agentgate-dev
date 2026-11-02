@@ -636,11 +636,15 @@ def test_unhealthy_created_pod_is_still_deleted(mode, monkeypatch):
 
     monkeypatch.setattr(peer, "request_json", not_ready)
     now = [0.0]
+    sleeps = []
 
     def advance(seconds):
+        sleeps.append(seconds)
         now[0] += seconds
 
     adapter = _adapter(mode, peer, _TraceServer(), sleep=advance, monotonic=lambda: now[0])
+    if mode == "yunxia":
+        adapter.settings = replace(adapter.settings, post_health_sleep_seconds=15)
     try:
         with pytest.raises(TargetExecutionError, match="health check timed out"):
             adapter.start(_request(mode))
@@ -649,6 +653,7 @@ def test_unhealthy_created_pod_is_still_deleted(mode, monkeypatch):
     assert adapter.pod_lifecycle["health"] == "failed"
     assert adapter.pod_lifecycle["delete"] == "succeeded"
     assert health_calls == [10] * 10
+    assert sleeps == [1] * 10
     assert peer.chat_count == 0
     assert peer.deleted
 

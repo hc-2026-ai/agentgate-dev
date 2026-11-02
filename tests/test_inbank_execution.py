@@ -5,6 +5,7 @@ import threading
 from contextlib import closing
 from dataclasses import replace
 from time import monotonic
+from unittest.mock import Mock
 
 import pytest
 from test_inbank_trace_server_adapters import (
@@ -21,6 +22,7 @@ from agentgate.application.result_reader import ResultReader
 from agentgate.domain import Case, CaseTurn, EvaluatorSpec, Outcome, RunStatus, Trace
 from agentgate.evaluator.executor import execute_evaluators
 from agentgate.evaluator.rule.output import FinalOutputEvaluator
+from agentgate.integrations.targets.inbank import yunxia
 from agentgate.run.engine import RunEngine
 from agentgate.run.target_protocol import (
     CaseExecutionPending,
@@ -431,3 +433,125 @@ def test_total_timeout_defaults_to_customer_unlimited_and_can_be_configured(mode
     assert _trace_wait_settings(mode, trace_environment=values).total_timeout_seconds == (
         float(configured) if configured else 0
     )
+
+
+@pytest.mark.parametrize("configured,expected", [(None, 15.0), ("0", 0.0), ("2.5", 2.5)])
+def test_yunxia_post_health_sleep_defaults_and_environment_override(configured, expected):
+    values = {
+        "AGENTGATE_INBANK_CREATE_BASE_URL": "https://bank.test",
+        "AGENTGATE_INBANK_YUNXIA_HEALTH_BASE_URL": "https://bank.test",
+        "AGENTGATE_INBANK_YUNXIA_POD_API_BASE_URL": "https://bank.test",
+        "AGENTGATE_INBANK_YUNXIA_DELETE_BASE_URL": "https://bank.test",
+        "AGENTGATE_INBANK_YUNXIA_AGENT_NAMESPACE": "chatabc",
+    }
+    if configured is not None:
+        values["AGENTGATE_INBANK_YUNXIA_POST_HEALTH_SLEEP_SECONDS"] = configured
+    assert yunxia.load_yunxia_settings(values).post_health_sleep_seconds == expected
+
+
+def test_yunxia_settings_default_post_health_sleep_is_fifteen_seconds():
+    settings = yunxia.YunxiaSettings(
+        create_base_url="https://bank.test",
+        health_base_url="https://bank.test",
+        pod_api_base_url="https://bank.test",
+        delete_base_url="https://bank.test",
+        agent_namespace="chatabc",
+    )
+    assert settings.post_health_sleep_seconds == 15
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("source", ["settings", "environment"])
+def test_yunxia_post_health_sleep_rejects_invalid_duration(value, source):
+    with pytest.raises(ValueError):
+        if source == "environment":
+            _trace_wait_settings("yunxia", trace_environment={
+                "AGENTGATE_INBANK_YUNXIA_POST_HEALTH_SLEEP_SECONDS": str(value),
+            })
+        else:
+            replace(_trace_wait_settings("yunxia"), post_health_sleep_seconds=value)
+
+
+@pytest.mark.parametrize("mode,delay", [
+    ("base", 15.0), ("workflow", 15.0),
+    ("yunxia", 15.0), ("yunxia", 0.0), ("yunxia", 2.5),
+])
+def test_only_yunxia_sleeps_once_after_health_before_multicase_messages(monkeypatch, mode, delay):
+    peer = _Transport(mode)
+    original_json, original_bytes = peer.request_json, peer.request_bytes
+    clock = _Clock()
+    events = []
+
+    def request_json(method, url, **kwargs):
+        result = original_json(method, url, **kwargs)
+        if "/createAgent" in url:
+            events.append("create")
+        elif "/health" in url:
+            events.append("healthy")
+        return result
+
+    def request_bytes(method, url, **kwargs):
+        events.append("message")
+        return original_bytes(method, url, **kwargs)
+
+    def sleep(seconds):
+        events.append(("sleep", seconds))
+        clock.sleep(seconds)
+
+    monkeypatch.setattr(peer, "request_json", request_json)
+    monkeypatch.setattr(peer, "request_bytes", request_bytes)
+    server = _TraceServer()
+    monkeypatch.setattr(server, "fetch_events", Mock(side_effect=TargetExecutionError(
+        "rejected", "no trace",
+    )))
+    adapter = _adapter(mode, peer, server, sleep=sleep, monotonic=clock.monotonic)
+    if mode == "yunxia":
+        adapter.settings = replace(adapter.settings, post_health_sleep_seconds=delay)
+    request = _request(mode)
+    second = replace(request, execution_id="execution-2", case=request.case.model_copy(update={
+        "id": "case-2",
+    }))
+    try:
+        results = [adapter.wait(adapter.start(item), 30) for item in (request, second)]
+    finally:
+        adapter.close()
+
+    expected_sleep = [("sleep", delay)] if mode == "yunxia" and delay else []
+    assert events == ["create", "healthy", *expected_sleep, *(["message"] * 4)]
+    assert all(result.error is None for result in results)
+    assert all(len(result.inline_trace.turn_outcomes) == 2 for result in results)
+    assert peer.chat_count == 4 and peer.deleted
+
+
+def test_yunxia_post_health_sleep_preserves_independent_execution_budgets(monkeypatch):
+    peer = _Transport("yunxia")
+    original = peer.request_bytes
+    clock = _Clock()
+    message_times, request_timeouts = [], []
+
+    def respond(method, url, **kwargs):
+        message_times.append(clock.now)
+        request_timeouts.append(kwargs["timeout"])
+        clock.now += 1
+        return original(method, url, **kwargs)
+
+    monkeypatch.setattr(peer, "request_bytes", respond)
+    server = _TraceServer()
+    monkeypatch.setattr(server, "fetch_events", Mock(side_effect=TargetExecutionError(
+        "rejected", "no trace",
+    )))
+    adapter = _adapter("yunxia", peer, server, sleep=clock.sleep, monotonic=clock.monotonic)
+    adapter.settings = replace(
+        adapter.settings, post_health_sleep_seconds=15, total_timeout_seconds=5,
+    )
+    request = replace(_request("yunxia"), timeout_seconds=1)
+    try:
+        result = adapter.wait(adapter.start(request), 30)
+    finally:
+        adapter.close()
+
+    assert result.error is None
+    assert message_times == [15, 16]
+    assert request_timeouts == [1, 1]
+    assert clock.sleeps == [15]
+    assert peer.chat_count == 2 and peer.deleted

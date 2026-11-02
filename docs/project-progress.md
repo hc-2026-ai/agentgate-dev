@@ -2,6 +2,29 @@
 
 Last updated: 2026-10-19
 
+## 2026-11-02 — Yunxia post-health startup delay
+
+Implement the customer-requested startup buffer in the existing Yunxia adapter:
+after a newly created Pod passes its health check, wait before starting Case
+execution. `AGENTGATE_INBANK_YUNXIA_POST_HEALTH_SLEEP_SECONDS` defaults to 15 seconds;
+0 disables it and fractional seconds are supported. Reuse the existing injected
+sleep function and log the delay's start and completion with Run and Pod identifiers.
+The delay runs once per Pod, before the first Case, not once per Case or Turn.
+It belongs to Pod preparation; existing health and conversation timeout budgets
+retain their current meanings. Both in-bank and integrated tasks use this adapter;
+ChatABC base/workflow and external targets do not gain a delay.
+
+The production change is confined to `yunxia.py` and the environment sample.
+Focused regression tests use a fake clock; shared test helpers explicitly disable
+the new delay to preserve existing timing assertions. Five related backend modules
+passed **673 tests**, with **28 skipped**. Six HTTP tests required a separate run
+with local loopback binding enabled after the sandbox denied opening their test
+server. Ruff and whitespace checks passed. Coverage includes default and configured
+delays, zero disablement, health-before-delay-before-message ordering, reuse across
+two Cases with two Turns each, cleanup after failed health checks, unaffected
+ChatABC execution, and independent execution timeout budgets. These are local
+contract tests; customer in-bank acceptance has not been performed.
+
 ## 2026-10-19 — Restore complete sample expectations
 
 The current sample page replaces the two simplified state/tool controls with the
