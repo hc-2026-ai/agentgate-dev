@@ -563,7 +563,7 @@ watch(sampleId, () => {
             <p class="muted">
               {{
                 manifest.metric_plan.id === 'p1-equal-mean'
-                  ? '按适用评估结果等权汇总'
+                  ? '先计算每条用例的有效评估器均分，再对有得分的用例等权平均'
                   : manifest.metric_plan.id
               }}
             </p>

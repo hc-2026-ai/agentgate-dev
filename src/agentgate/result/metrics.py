@@ -30,6 +30,8 @@ def _counts(results: Iterable[EvaluationResult]) -> dict[str, int]:
 
 
 def _score(results: Sequence[EvaluationResult]) -> float | None:
+    """Average numeric evaluator scores per Case, then weight Cases equally."""
+
     by_case: dict[str, list[float]] = defaultdict(list)
     for result in results:
         if result.score is not None:
@@ -114,13 +116,10 @@ def calculate_metrics(
             **_counts(related),
         ))
 
-    dimension_scores = tuple(
-        item.score for item in dimensions if item.score is not None
-    )
     overall = MetricSummary(
         key="overall",
         level="overall",
-        score=mean(dimension_scores) if dimension_scores else None,
+        score=_score(primary),
         **_counts(primary),
     )
     return (overall, *kinds, *dimensions, *metric_summaries)

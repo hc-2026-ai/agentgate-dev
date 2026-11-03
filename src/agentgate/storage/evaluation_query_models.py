@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from agentgate.domain import RunStatus
 from agentgate.domain.evaluation_task import EvaluationTaskKind
 
-SUMMARY_VERSION = 1
+SUMMARY_VERSION = 2
 
 
 class SummaryNotReady(RuntimeError):
@@ -96,7 +96,7 @@ class CompletedRunSummary(BaseModel):
     manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     source_results_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     result_count: int = Field(ge=0)
-    summary_version: Literal[1] = SUMMARY_VERSION
+    summary_version: Literal[2] = SUMMARY_VERSION
     overall_score: float | None = Field(default=None, ge=0, le=1)
     gate_reason: str
 

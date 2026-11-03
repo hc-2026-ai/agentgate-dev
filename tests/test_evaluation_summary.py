@@ -81,6 +81,132 @@ def test_old_completion_backfill_and_delete(tmp_path):
         assert not db.execute("SELECT * FROM agentgate_run_summaries").fetchall()
 
 
+def test_old_scoring_summary_is_pending_until_backfill_preserves_evidence(tmp_path):
+    from test_run_engine import evaluate_case
+
+    from agentgate.domain import (
+        Case,
+        CaseTurn,
+        EvaluatorSpec,
+        FailureStage,
+        Outcome,
+        ReleaseGateSpec,
+        Trace,
+    )
+    from agentgate.result.report import build_evaluation_report
+
+    repo = SQLiteRepository(tmp_path / "old-scoring.db")
+    specs = tuple(
+        EvaluatorSpec(
+            id=identifier,
+            name=identifier,
+            dimension=dimension,
+            metric=identifier,
+            implementation_id="final_output",
+        )
+        for identifier, dimension in (("one", "tool_use"), ("two", "tool_use"), ("three", "state"))
+    )
+    cases = tuple(
+        Case(id=identifier, name=identifier, turns=(CaseTurn(input={"message": "hello"}),))
+        for identifier in ("case-1", "case-2")
+    )
+    run = pending_run(
+        cases=cases,
+        evaluator_specs=specs,
+        primary_evaluator_ids=tuple(spec.id for spec in specs),
+        gate_spec=ReleaseGateSpec(minimum_score=0.8),
+    ).model_copy(update={"user_team_id": "history"})
+    repo.save_run(run)
+    repo.save_evaluation_task(EvaluationTask(kind="single", run_ids=(run.id,)))
+    running = repo.claim_pending_run(run.id, utcnow())
+    completed = transition_run(running, RunStatus.COMPLETED)
+    results = []
+    for index, (case, scores) in enumerate(
+        zip(cases, ((1.0, 0.0, 1.0), (1.0, None, None)), strict=True), 1
+    ):
+        trace = Trace(trace_id=f"{index:032x}", run_id=run.id, case_id=case.id, spans=())
+        repo.save_trace(trace)
+        for spec, score in zip(specs, scores, strict=True):
+            item = evaluate_case(case, trace, (spec,))[0]
+            if score == 0:
+                item = item.model_copy(
+                    update={
+                        "outcome": Outcome.FAIL,
+                        "score": score,
+                        "checks": tuple(
+                            c.model_copy(
+                                update={
+                                    "outcome": Outcome.FAIL,
+                                    "score": score,
+                                    "failure_stage": FailureStage.FINAL_STATE,
+                                    "failure_sequence": 0,
+                                }
+                            )
+                            for c in item.checks
+                        ),
+                        "primary_failure_stage": FailureStage.FINAL_STATE,
+                    }
+                )
+            elif score is None:
+                item = item.model_copy(
+                    update={
+                        "outcome": Outcome.NOT_APPLICABLE,
+                        "score": None,
+                        "checks": tuple(
+                            c.model_copy(update={"outcome": Outcome.NOT_APPLICABLE, "score": None})
+                            for c in item.checks
+                        ),
+                    }
+                )
+            results.append(item.model_copy(update={"id": f"{case.id}-{spec.id}"}))
+    repo.save_results(results)
+    repo.save_completed_run(completed, build_completed_run_summary(completed, results))
+    with repo._connect() as db:
+        db.execute(
+            "UPDATE agentgate_run_summaries SET summary_version=1,overall_score=0.75,"
+            "gate_reason='score_below_threshold' WHERE run_id=?",
+            (run.id,),
+        )
+        original_run = db.execute(
+            "SELECT payload FROM agentgate_runs WHERE id=?", (run.id,)
+        ).fetchone()[0]
+        original_results = db.execute(
+            "SELECT id,payload FROM agentgate_results WHERE run_id=? ORDER BY id", (run.id,)
+        ).fetchall()
+        original_results = [tuple(row) for row in original_results]
+
+    pending = repo.list_evaluation_task_summaries(TaskSummaryQuery(), user_team_id="history")
+    assert pending.items[0].runs[0].summary_pending
+    assert pending.items[0].runs[0].overall_score is None
+    overview = repo.get_evaluation_overview_summary(EvaluationQuery(), user_team_id="history")
+    assert overview.pending_summary_task_count == 1
+    assert overview.average_score is None and overview.scored_run_count == 0
+
+    assert not backfill(repo, apply=True)["failures"]
+    page = repo.list_evaluation_task_summaries(TaskSummaryQuery(), user_team_id="history")
+    overview = repo.get_evaluation_overview_summary(EvaluationQuery(), user_team_id="history")
+    report = build_evaluation_report(
+        repo.get_run(run.id, user_team_id="history"), repo.list_results(run.id)
+    )
+    overall = next(metric for metric in report.metrics if metric.level == "overall")
+    assert overall.score == pytest.approx(5 / 6)
+    assert page.items[0].runs[0].overall_score == overall.score == overview.average_score
+    assert page.items[0].runs[0].gate_reason == report.release_gate.reason_code == "threshold_met"
+    assert not page.items[0].summary_pending and overview.pending_summary_task_count == 0
+    assert overview.scored_run_count == 1
+    with repo._connect() as db:
+        assert (
+            db.execute("SELECT payload FROM agentgate_runs WHERE id=?", (run.id,)).fetchone()[0]
+            == original_run
+        )
+        assert [
+            tuple(row)
+            for row in db.execute(
+                "SELECT id,payload FROM agentgate_results WHERE run_id=? ORDER BY id", (run.id,)
+            ).fetchall()
+        ] == original_results
+
+
 def test_rerun_history_and_literal_keyword(tmp_path):
     repo = SQLiteRepository(tmp_path / "q.db")
     task, runs = seed(repo, "a")
